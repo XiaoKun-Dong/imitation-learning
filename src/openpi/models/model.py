@@ -46,6 +46,47 @@ IMAGE_KEYS = (
 # This may need change if we release a small model.
 IMAGE_RESOLUTION = (224, 224)
 
+# Target bboxes are always absolute pixel coordinates in the current image frame:
+# [x1, y1, x2, y2], with x2/y2 exclusive. They are not normalized to [0, 1].
+TARGET_BBOX_FORMAT = "xyxy_pixel_exclusive"
+
+
+def _resize_target_mask(mask: at.Array, image_resolution: tuple[int, int]) -> at.Bool[at.Array, "*b h w"]:
+    mask = jnp.asarray(mask)
+    resized = image_tools.resize_with_pad(
+        mask[..., None].astype(jnp.float32),
+        *image_resolution,
+        method=jax.image.ResizeMethod.NEAREST,
+    )
+    return resized[..., 0] > 0.5
+
+
+def _resize_target_crop(crop: at.Array, image_resolution: tuple[int, int]) -> at.Array:
+    crop = jnp.asarray(crop)
+    if crop.shape[-1] != 3:
+        raise ValueError(f"target_crop must have 3 channels, got shape {crop.shape}")
+    return image_tools.resize_with_pad(crop, *image_resolution)
+
+
+def _resize_target_bbox(
+    bbox: at.Array,
+    original_hw: tuple[int, int],
+    image_resolution: tuple[int, int],
+) -> at.Array:
+    """Resize an absolute pixel bbox [x1, y1, x2, y2) through resize-with-pad geometry."""
+    bbox = jnp.asarray(bbox, dtype=jnp.float32)
+    cur_height, cur_width = original_hw
+    target_height, target_width = image_resolution
+    ratio = max(cur_width / target_width, cur_height / target_height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    pad_h0 = (target_height - resized_height) // 2
+    pad_w0 = (target_width - resized_width) // 2
+
+    scale = jnp.asarray([resized_width / cur_width, resized_height / cur_height] * 2, dtype=jnp.float32)
+    offset = jnp.asarray([pad_w0, pad_h0, pad_w0, pad_h0], dtype=jnp.float32)
+    return bbox * scale + offset
+
 
 # Data format
 #
@@ -99,6 +140,15 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional target-object conditioning for object-centric action generation.
+    # These are used by the pi0-style action expert as a lightweight conditioning signal
+    # without changing the main vision-language backbone.
+    target_mask: at.Bool[ArrayT, "b h w"] | None = None
+    # Absolute pixel bbox [x1, y1, x2, y2) in the same image frame as target_mask/crop.
+    # x2/y2 are exclusive, so area is (x2 - x1) * (y2 - y1).
+    target_bbox: at.Float[ArrayT, "b 4"] | None = None
+    target_crop: at.Float[ArrayT, "b h w c"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -118,12 +168,25 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        target_crop = data.get("target_crop")
+        if target_crop is not None:
+            # Object crops are adapter inputs, not backbone RGB inputs. Keep them in
+            # [0, 1] so black padded/missing regions stay at zero and match dropout.
+            if getattr(target_crop, "dtype", None) == np.uint8:
+                target_crop = target_crop.astype(np.float32) / 255.0
+            elif hasattr(target_crop, "dtype") and target_crop.dtype == torch.uint8:
+                target_crop = target_crop.to(torch.float32) / 255.0
+            else:
+                target_crop = target_crop.astype(np.float32)
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            target_mask=data.get("target_mask"),
+            target_bbox=data.get("target_bbox"),
+            target_crop=target_crop,
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -158,6 +221,7 @@ def preprocess_observation(
 
     batch_shape = observation.state.shape[:-1]
 
+    first_image_shape = observation.images[image_keys[0]].shape[1:3]
     out_images = {}
     for key in image_keys:
         image = observation.images[key]
@@ -188,6 +252,20 @@ def preprocess_observation(
 
         out_images[key] = image
 
+    target_mask = observation.target_mask
+    if target_mask is not None and target_mask.shape[-2:] != image_resolution:
+        target_mask = _resize_target_mask(target_mask, image_resolution)
+
+    target_crop = observation.target_crop
+    if target_crop is not None and target_crop.shape[1:3] != image_resolution:
+        target_crop = _resize_target_crop(target_crop, image_resolution)
+
+    target_bbox = observation.target_bbox
+    if target_bbox is not None and first_image_shape != image_resolution:
+        # Bboxes are absolute pixel coordinates [x1, y1, x2, y2) in the source image frame.
+        # They must not be normalized to [0, 1].
+        target_bbox = _resize_target_bbox(target_bbox, first_image_shape, image_resolution)
+
     # obtain mask
     out_masks = {}
     for key in out_images:
@@ -197,15 +275,19 @@ def preprocess_observation(
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
-    return Observation(
-        images=out_images,
-        image_masks=out_masks,
-        state=observation.state,
-        tokenized_prompt=observation.tokenized_prompt,
-        tokenized_prompt_mask=observation.tokenized_prompt_mask,
-        token_ar_mask=observation.token_ar_mask,
-        token_loss_mask=observation.token_loss_mask,
-    )
+    with at.disable_typechecking():
+        return Observation(
+            images=out_images,
+            image_masks=out_masks,
+            state=observation.state,
+            tokenized_prompt=observation.tokenized_prompt,
+            tokenized_prompt_mask=observation.tokenized_prompt_mask,
+            target_mask=target_mask,
+            target_bbox=target_bbox,
+            target_crop=target_crop,
+            token_ar_mask=observation.token_ar_mask,
+            token_loss_mask=observation.token_loss_mask,
+        )
 
 
 @dataclasses.dataclass(frozen=True)

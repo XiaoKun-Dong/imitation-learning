@@ -67,6 +67,44 @@ def test_make_bool_mask():
     assert _transforms.make_bool_mask(2, 0, 2) == (True, True, True, True)
 
 
+def test_resize_bbox_with_pad_keeps_pixel_convention():
+    bbox = np.asarray([10, 20, 30, 50], dtype=np.float32)
+
+    resized = _transforms._resize_bbox_with_pad(bbox, source_hw=(100, 200), target_hw=(224, 224))
+
+    # 200x100 -> 224x112 with vertical padding 56. Coordinates remain absolute
+    # pixels in the resized image frame; they are not normalized to [0, 1].
+    assert np.allclose(resized, np.asarray([11.2, 78.4, 33.6, 112.0], dtype=np.float32))
+    assert resized.max() > 1.0
+
+
+def test_resize_images_resizes_target_object_fields():
+    data = {
+        "image": {
+            "base_0_rgb": np.zeros((100, 200, 3), dtype=np.uint8),
+        },
+        "target_mask": np.zeros((100, 200), dtype=bool),
+        "target_bbox": np.asarray([10, 20, 30, 50], dtype=np.float32),
+        "target_crop": np.zeros((100, 200, 3), dtype=np.uint8),
+    }
+    data["target_mask"][20:50, 10:30] = True
+    data["target_crop"][20:50, 10:30] = 255
+
+    transformed = _transforms.ResizeImages(224, 224)(data)
+
+    assert transformed["image"]["base_0_rgb"].shape == (224, 224, 3)
+    assert transformed["target_mask"].shape == (224, 224)
+    assert transformed["target_mask"].dtype == np.bool_
+    assert transformed["target_crop"].shape == (224, 224, 3)
+    assert transformed["target_crop"].dtype == np.uint8
+    assert transformed["target_bbox"].shape == (4,)
+    assert transformed["target_bbox"].dtype == np.float32
+    assert np.allclose(transformed["target_bbox"], np.asarray([11.2, 78.4, 33.6, 112.0], dtype=np.float32))
+    assert transformed["target_bbox"].max() > 1.0
+    assert transformed["target_mask"].any()
+    assert transformed["target_crop"].sum() > 0
+
+
 def test_tokenize_prompt():
     tokenizer = _tokenizer.PaligemmaTokenizer(max_len=12)
     transform = _transforms.TokenizePrompt(tokenizer)

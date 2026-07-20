@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -32,6 +33,18 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+
+def _freeze_vla_backbone_filter() -> Filter:
+    """Freeze the VLA backbone and leave action/object adapters trainable."""
+    action_expert_filter = nnx_utils.PathRegex("PaliGemma/llm/.*_1.*")
+    return nnx.Any(
+        nnx_utils.PathRegex("PaliGemma/img/.*"),
+        nnx.All(
+            nnx_utils.PathRegex("PaliGemma/llm/.*"),
+            nnx.Not(action_expert_filter),
+        ),
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +78,9 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional local LeRobot dataset root. If set, repo_id metadata is read from
+    # this directory instead of the default Hugging Face cache.
+    root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -167,6 +183,8 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # Optional local LeRobot dataset root.
+    root: str | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -182,6 +200,7 @@ class DataConfigFactory(abc.ABC):
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            root=self.root,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -287,6 +306,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    include_object_condition: bool = False
+    object_condition_keys: tuple[str, ...] | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -298,17 +319,23 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # For your own dataset, first figure out what keys your environment passes to the policy server
         # and then modify the mappings below so your dataset's keys get matched to those target keys.
         # The repack transform simply remaps key names here.
+        repack_structure = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.include_object_condition or self.object_condition_keys:
+            object_condition_keys = self.object_condition_keys or ("target_mask", "target_bbox", "target_crop")
+            invalid_keys = set(object_condition_keys) - {"target_mask", "target_bbox", "target_crop"}
+            if invalid_keys:
+                raise ValueError(f"Invalid object condition keys: {sorted(invalid_keys)}")
+            repack_structure.update({key: key for key in object_condition_keys})
+
         repack_transform = _transforms.Group(
             inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
+                _transforms.RepackTransform(repack_structure)
             ]
         )
 
@@ -556,6 +583,43 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _make_pi05_libero_object_mask_ablation_config(
+    *,
+    name: str,
+    object_condition_keys: Sequence[str],
+    object_condition_dropout_rate: float = 0.1,
+) -> TrainConfig:
+    return TrainConfig(
+        name=name,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            object_condition_dropout_rate=object_condition_dropout_rate,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="local/libero_object_mask",
+            root="data/lerobot/local/libero_object_mask",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            object_condition_keys=tuple(object_condition_keys),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=_freeze_vla_backbone_filter(),
+        num_train_steps=30_000,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -760,6 +824,49 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_object_mask",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="local/libero_object_mask",
+            root="data/lerobot/local/libero_object_mask",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            include_object_condition=True,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=_freeze_vla_backbone_filter(),
+        num_train_steps=30_000,
+    ),
+    _make_pi05_libero_object_mask_ablation_config(
+        name="pi05_libero_object_none",
+        object_condition_keys=(),
+        object_condition_dropout_rate=0.0,
+    ),
+    _make_pi05_libero_object_mask_ablation_config(
+        name="pi05_libero_object_bbox_only",
+        object_condition_keys=("target_bbox",),
+    ),
+    _make_pi05_libero_object_mask_ablation_config(
+        name="pi05_libero_object_mask_only",
+        object_condition_keys=("target_mask",),
+    ),
+    _make_pi05_libero_object_mask_ablation_config(
+        name="pi05_libero_object_crop_only",
+        object_condition_keys=("target_crop",),
     ),
     #
     # Fine-tuning Aloha configs.

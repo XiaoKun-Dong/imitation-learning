@@ -7,7 +7,7 @@ import pathlib
 import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.envs import SegmentationRenderEnv
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
@@ -32,7 +32,7 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_object"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
@@ -120,6 +120,7 @@ def eval_libero(args: Args) -> None:
                     wrist_img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
+                    target_mask, target_bbox, target_crop = _get_target_object_condition(env, obs, img, args.resize_size)
 
                     # Save preprocessed image for replay video
                     replay_images.append(img)
@@ -137,6 +138,9 @@ def eval_libero(args: Args) -> None:
                                     obs["robot0_gripper_qpos"],
                                 )
                             ),
+                            "target_mask": target_mask,
+                            "target_bbox": target_bbox,
+                            "target_crop": target_crop,
                             "prompt": str(task_description),
                         }
 
@@ -190,10 +194,64 @@ def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
-    env = OffScreenRenderEnv(**env_args)
+    env_args = {
+        "bddl_file_name": task_bddl_file,
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+        "camera_segmentations": "instance",
+    }
+    env = SegmentationRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
+
+
+def _get_target_object_condition(env, obs, image: np.ndarray, resize_size: int):
+    """Build target object mask/bbox/crop in the same frame as observation/image.
+
+    LIBERO's BDDL obj_of_interest may include destination objects. For LIBERO Object,
+    the first object is the manipulated target, which is the signal we want here.
+    """
+    seg = _get_agentview_segmentation(obs)
+    seg = np.ascontiguousarray(seg[::-1, ::-1])
+    target_mask = _target_mask_from_segmentation(env, seg)
+    target_mask = image_tools.resize_with_pad(target_mask[..., None].astype(np.uint8) * 255, resize_size, resize_size)
+    target_mask = target_mask[..., 0] > 127
+    target_bbox = _bbox_from_mask(target_mask)
+    target_crop = _crop_from_bbox(image, target_bbox)
+    return target_mask, target_bbox, target_crop
+
+
+def _get_agentview_segmentation(obs):
+    for key in ("agentview_segmentation_instance", "agentview_instance_segmentation", "agentview_segmentation"):
+        if key in obs:
+            return obs[key]
+    seg_keys = [key for key in obs if "agentview" in key and "seg" in key]
+    raise KeyError(f"Could not find agentview segmentation in obs. Available segmentation-like keys: {seg_keys}")
+
+
+def _target_mask_from_segmentation(env, segmentation_image):
+    if not env.obj_of_interest:
+        return np.zeros(segmentation_image.shape[:2], dtype=bool)
+    target_obj = env.obj_of_interest[0]
+    target_id = env.instance_to_id[target_obj]
+    return segmentation_image == target_id
+
+
+def _bbox_from_mask(mask):
+    """Return absolute pixel bbox [x1, y1, x2, y2) with x2/y2 exclusive."""
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return np.zeros((4,), dtype=np.float32)
+    return np.asarray([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float32)
+
+
+def _crop_from_bbox(image, bbox):
+    x1, y1, x2, y2 = bbox.astype(np.int32)
+    padded = np.zeros_like(image)
+    if x2 <= x1 or y2 <= y1:
+        return padded
+    padded[y1:y2, x1:x2] = image[y1:y2, x1:x2]
+    return padded
 
 
 def _quat2axisangle(quat):

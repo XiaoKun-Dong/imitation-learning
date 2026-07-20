@@ -15,6 +15,9 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+OBJECT_CONDITION_GRID_SIZE = 16
+OBJECT_CONDITION_FEATURE_DIM = OBJECT_CONDITION_GRID_SIZE * OBJECT_CONDITION_GRID_SIZE * 4 + 9
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -67,6 +70,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.object_condition_dropout_rate = config.object_condition_dropout_rate
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -98,9 +102,104 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        # Lightweight object encoder for target mask / bbox / crop conditioning.
+        # It keeps the PaliGemma backbone unchanged, but preserves coarse 2D object
+        # layout before producing a token-sized bias for the action expert.
+        self.object_condition_proj_in = nnx.Linear(
+            OBJECT_CONDITION_FEATURE_DIM, action_expert_config.width, rngs=rngs
+        )
+        self.object_condition_proj_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def _resize_object_map(
+        self, x: at.Float[at.Array, "b h w c"], *, method: jax.image.ResizeMethod
+    ) -> at.Float[at.Array, "b 16 16 c"]:
+        return jax.image.resize(
+            x,
+            (x.shape[0], OBJECT_CONDITION_GRID_SIZE, OBJECT_CONDITION_GRID_SIZE, x.shape[-1]),
+            method=method,
+        )
+
+    def _embed_object_condition(self, obs: _model.Observation) -> at.Float[at.Array, "b emb"] | None:
+        """Encode optional target-object inputs into a single action-expert conditioning vector."""
+        if obs.target_mask is None and obs.target_bbox is None and obs.target_crop is None:
+            return None
+
+        batch_size = obs.state.shape[0]
+        crop_grid = jnp.zeros(
+            (batch_size, OBJECT_CONDITION_GRID_SIZE, OBJECT_CONDITION_GRID_SIZE, 3),
+            dtype=jnp.float32,
+        )
+        mask_grid = jnp.zeros(
+            (batch_size, OBJECT_CONDITION_GRID_SIZE, OBJECT_CONDITION_GRID_SIZE, 1),
+            dtype=jnp.float32,
+        )
+        bbox_features = jnp.zeros((batch_size, 4), dtype=jnp.float32)
+
+        if obs.target_crop is not None:
+            crop = jnp.asarray(obs.target_crop, dtype=jnp.float32)
+            crop_grid = self._resize_object_map(crop, method=jax.image.ResizeMethod.LINEAR)
+
+        if obs.target_bbox is not None:
+            bbox_features = jnp.asarray(obs.target_bbox, dtype=jnp.float32)
+
+        if obs.target_mask is not None:
+            mask = jnp.asarray(obs.target_mask[..., None], dtype=jnp.float32)
+            mask_grid = self._resize_object_map(mask, method=jax.image.ResizeMethod.NEAREST)
+
+        # Spatial moments give the action expert an explicit coarse target center,
+        # extent, and visible area even when target_crop is missing.
+        flat_mask = mask_grid[..., 0].reshape(batch_size, -1)
+        area = jnp.mean(flat_mask, axis=-1, keepdims=True)
+        ys = jnp.linspace(0.0, 1.0, OBJECT_CONDITION_GRID_SIZE, dtype=jnp.float32)
+        xs = jnp.linspace(0.0, 1.0, OBJECT_CONDITION_GRID_SIZE, dtype=jnp.float32)
+        yy, xx = jnp.meshgrid(ys, xs, indexing="ij")
+        flat_x = xx.reshape(1, -1)
+        flat_y = yy.reshape(1, -1)
+        denom = jnp.sum(flat_mask, axis=-1, keepdims=True) + 1e-6
+        cx = jnp.sum(flat_mask * flat_x, axis=-1, keepdims=True) / denom
+        cy = jnp.sum(flat_mask * flat_y, axis=-1, keepdims=True) / denom
+        var_x = jnp.sum(flat_mask * jnp.square(flat_x - cx), axis=-1, keepdims=True) / denom
+        var_y = jnp.sum(flat_mask * jnp.square(flat_y - cy), axis=-1, keepdims=True) / denom
+        mask_features = jnp.concatenate([area, cx, cy, var_x, var_y], axis=-1)
+
+        object_grid = jnp.concatenate([crop_grid, mask_grid], axis=-1).reshape(batch_size, -1)
+        object_features = jnp.concatenate([object_grid, bbox_features, mask_features], axis=-1)
+        object_emb = self.object_condition_proj_in(object_features)
+        object_emb = nnx.swish(object_emb)
+        object_emb = self.object_condition_proj_out(object_emb)
+        return nnx.swish(object_emb)
+
+    def _drop_object_condition(
+        self, rng: at.KeyArrayLike, obs: _model.Observation, *, train: bool
+    ) -> _model.Observation:
+        """Drop object inputs per example during training for segmentation robustness."""
+        rate = self.object_condition_dropout_rate
+        if not train or rate == 0.0:
+            return obs
+        if obs.target_mask is None and obs.target_bbox is None and obs.target_crop is None:
+            return obs
+
+        batch_size = obs.state.shape[0]
+        keep = jax.random.bernoulli(rng, 1.0 - rate, (batch_size,))
+
+        def apply_keep(value):
+            if value is None:
+                return None
+            keep_shape = (batch_size,) + (1,) * (value.ndim - 1)
+            keep_mask = keep.reshape(keep_shape)
+            if value.dtype == jnp.bool_:
+                return jnp.logical_and(value, keep_mask)
+            return value * keep_mask.astype(value.dtype)
+
+        with at.disable_typechecking():
+            return obs.replace(
+                target_mask=apply_keep(obs.target_mask),
+                target_bbox=apply_keep(obs.target_bbox),
+                target_crop=apply_keep(obs.target_crop),
+            )
 
     @at.typecheck
     def embed_prefix(
@@ -159,6 +258,7 @@ class Pi0(_model.BaseModel):
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        object_cond = self._embed_object_condition(obs)
         if self.pi05:
             # time MLP (for adaRMS)
             time_emb = self.time_mlp_in(time_emb)
@@ -176,6 +276,12 @@ class Pi0(_model.BaseModel):
             action_time_tokens = self.action_time_mlp_out(action_time_tokens)
             action_expert_tokens = action_time_tokens
             adarms_cond = None
+
+        # Optional target-object conditioning: explicitly bias action expert tokens with a
+        # compact mask/bbox/crop embedding so the policy can focus on the intended object.
+        if object_cond is not None:
+            action_expert_tokens = action_expert_tokens + object_cond[:, None, :]
+
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
@@ -189,8 +295,9 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, object_dropout_rng, noise_rng, time_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = self._drop_object_condition(object_dropout_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)

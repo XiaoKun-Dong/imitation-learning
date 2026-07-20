@@ -73,11 +73,21 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+    flat_params_shape = traverse_util.flatten_dict(params_shape)
+    flat_loaded_params = traverse_util.flatten_dict(loaded_params)
+    extra_loaded_keys = set(flat_loaded_params) - set(flat_params_shape)
+    if extra_loaded_keys:
+        raise ValueError(f"Loaded checkpoint contains unexpected params: {sorted(extra_loaded_keys)}")
+    for key, loaded_value in flat_loaded_params.items():
+        expected_value = flat_params_shape[key]
+        if expected_value.shape != loaded_value.shape:
+            raise ValueError(f"Shape mismatch at {key}: expected {expected_value.shape}, got {loaded_value.shape}")
+        if expected_value.dtype != loaded_value.dtype:
+            raise ValueError(f"Dtype mismatch at {key}: expected {expected_value.dtype}, got {loaded_value.dtype}")
 
     # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
     return traverse_util.unflatten_dict(
-        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
+        {k: v for k, v in flat_loaded_params.items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
 
 
