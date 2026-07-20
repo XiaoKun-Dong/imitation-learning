@@ -16,7 +16,8 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 OBJECT_CONDITION_GRID_SIZE = 16
-OBJECT_CONDITION_FEATURE_DIM = OBJECT_CONDITION_GRID_SIZE * OBJECT_CONDITION_GRID_SIZE * 4 + 9
+OBJECT_CONDITION_PATCH_DIM = 6  # RGB crop, mask, and normalized x/y coordinates.
+OBJECT_CONDITION_GEOMETRY_DIM = 12  # bbox, mask moments, and target point.
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -71,6 +72,8 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.object_condition_dropout_rate = config.object_condition_dropout_rate
+        self.object_condition_num_heads = config.object_condition_num_heads
+        self.object_condition_residual_scale = config.object_condition_residual_scale
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -102,13 +105,31 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
-        # Lightweight object encoder for target mask / bbox / crop conditioning.
-        # It keeps the PaliGemma backbone unchanged, but preserves coarse 2D object
-        # layout before producing a token-sized bias for the action expert.
-        self.object_condition_proj_in = nnx.Linear(
-            OBJECT_CONDITION_FEATURE_DIM, action_expert_config.width, rngs=rngs
+        if action_expert_config.width % self.object_condition_num_heads != 0:
+            raise ValueError("action expert width must be divisible by object_condition_num_heads")
+        self.object_condition_patch_proj = nnx.Linear(
+            OBJECT_CONDITION_PATCH_DIM, action_expert_config.width, rngs=rngs
         )
-        self.object_condition_proj_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        self.object_condition_geometry_proj = nnx.Linear(
+            OBJECT_CONDITION_GEOMETRY_DIM, action_expert_config.width, rngs=rngs
+        )
+        self.object_condition_query_proj = nnx.Linear(
+            action_expert_config.width, action_expert_config.width, rngs=rngs
+        )
+        self.object_condition_key_proj = nnx.Linear(
+            action_expert_config.width, action_expert_config.width, rngs=rngs
+        )
+        self.object_condition_value_proj = nnx.Linear(
+            action_expert_config.width, action_expert_config.width, rngs=rngs
+        )
+        # Zero initialization makes a legacy policy's initial behavior exactly unchanged.
+        self.object_condition_output_proj = nnx.Linear(
+            action_expert_config.width,
+            action_expert_config.width,
+            kernel_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -122,9 +143,20 @@ class Pi0(_model.BaseModel):
             method=method,
         )
 
-    def _embed_object_condition(self, obs: _model.Observation) -> at.Float[at.Array, "b emb"] | None:
-        """Encode optional target-object inputs into a single action-expert conditioning vector."""
-        if obs.target_mask is None and obs.target_bbox is None and obs.target_crop is None:
+    def _embed_object_condition(
+        self, obs: _model.Observation
+    ) -> tuple[
+        at.Float[at.Array, "b object_s emb"],
+        at.Bool[at.Array, "b object_s"],
+        at.Bool[at.Array, " b"],
+    ] | None:
+        """Encode spatial object patches and geometry as cross-attention tokens."""
+        if (
+            obs.target_mask is None
+            and obs.target_bbox is None
+            and obs.target_crop is None
+            and obs.target_point is None
+        ):
             return None
 
         batch_size = obs.state.shape[0]
@@ -137,13 +169,20 @@ class Pi0(_model.BaseModel):
             dtype=jnp.float32,
         )
         bbox_features = jnp.zeros((batch_size, 4), dtype=jnp.float32)
+        point_features = jnp.zeros((batch_size, 3), dtype=jnp.float32)
 
         if obs.target_crop is not None:
             crop = jnp.asarray(obs.target_crop, dtype=jnp.float32)
             crop_grid = self._resize_object_map(crop, method=jax.image.ResizeMethod.LINEAR)
 
         if obs.target_bbox is not None:
-            bbox_features = jnp.asarray(obs.target_bbox, dtype=jnp.float32)
+            bbox_scale = jnp.asarray(
+                [_model.IMAGE_RESOLUTION[1], _model.IMAGE_RESOLUTION[0]] * 2, dtype=jnp.float32
+            )
+            bbox_features = jnp.asarray(obs.target_bbox, dtype=jnp.float32) / bbox_scale
+
+        if obs.target_point is not None:
+            point_features = jnp.asarray(obs.target_point, dtype=jnp.float32)
 
         if obs.target_mask is not None:
             mask = jnp.asarray(obs.target_mask[..., None], dtype=jnp.float32)
@@ -165,12 +204,65 @@ class Pi0(_model.BaseModel):
         var_y = jnp.sum(flat_mask * jnp.square(flat_y - cy), axis=-1, keepdims=True) / denom
         mask_features = jnp.concatenate([area, cx, cy, var_x, var_y], axis=-1)
 
-        object_grid = jnp.concatenate([crop_grid, mask_grid], axis=-1).reshape(batch_size, -1)
-        object_features = jnp.concatenate([object_grid, bbox_features, mask_features], axis=-1)
-        object_emb = self.object_condition_proj_in(object_features)
-        object_emb = nnx.swish(object_emb)
-        object_emb = self.object_condition_proj_out(object_emb)
-        return nnx.swish(object_emb)
+        coordinates = jnp.stack([xx, yy], axis=-1)
+        coordinates = jnp.broadcast_to(coordinates, (*crop_grid.shape[:3], 2))
+        patch_features = jnp.concatenate([crop_grid, mask_grid, coordinates], axis=-1)
+        patch_features = patch_features.reshape(batch_size, -1, OBJECT_CONDITION_PATCH_DIM)
+        patch_tokens = nnx.swish(self.object_condition_patch_proj(patch_features))
+
+        geometry_features = jnp.concatenate([bbox_features, mask_features, point_features], axis=-1)
+        geometry_token = nnx.swish(self.object_condition_geometry_proj(geometry_features))[:, None, :]
+        object_tokens = jnp.concatenate([patch_tokens, geometry_token], axis=1)
+
+        if obs.target_mask is not None:
+            patch_mask = mask_grid[..., 0] > 0.5
+        elif obs.target_crop is not None:
+            patch_mask = jnp.any(jnp.abs(crop_grid) > 0, axis=-1)
+        else:
+            patch_mask = jnp.zeros(crop_grid.shape[:3], dtype=jnp.bool_)
+        patch_mask = patch_mask.reshape(batch_size, -1)
+        object_token_mask = jnp.concatenate(
+            [patch_mask, jnp.ones((batch_size, 1), dtype=jnp.bool_)], axis=1
+        )
+
+        # Object dropout and missing segmentations must be true no-ops even though patch
+        # coordinates themselves are nonzero.
+        has_condition = (
+            jnp.any(jnp.abs(crop_grid) > 0, axis=(1, 2, 3))
+            | jnp.any(mask_grid > 0, axis=(1, 2, 3))
+            | jnp.any(jnp.abs(bbox_features) > 0, axis=1)
+            | jnp.any(jnp.abs(point_features) > 0, axis=1)
+        )
+        return object_tokens, object_token_mask, has_condition
+
+    def _cross_attend_object_condition(
+        self,
+        action_tokens: at.Float[at.Array, "b action_s emb"],
+        object_condition: tuple[
+            at.Float[at.Array, "b object_s emb"],
+            at.Bool[at.Array, "b object_s"],
+            at.Bool[at.Array, " b"],
+        ],
+    ) -> at.Float[at.Array, "b action_s emb"]:
+        """Let each action token independently retrieve target-object information."""
+        object_tokens, object_token_mask, has_condition = object_condition
+        query = self.object_condition_query_proj(action_tokens)
+        key = self.object_condition_key_proj(object_tokens)
+        value = self.object_condition_value_proj(object_tokens)
+
+        num_heads = self.object_condition_num_heads
+        head_dim = query.shape[-1] // num_heads
+        query = einops.rearrange(query, "b s (h d) -> b h s d", h=num_heads)
+        key = einops.rearrange(key, "b s (h d) -> b h s d", h=num_heads)
+        value = einops.rearrange(value, "b s (h d) -> b h s d", h=num_heads)
+        logits = jnp.einsum("bhqd,bhkd->bhqk", query, key) * (head_dim**-0.5)
+        logits = jnp.where(object_token_mask[:, None, None, :], logits, -jnp.inf)
+        weights = jax.nn.softmax(logits, axis=-1)
+        attended = jnp.einsum("bhqk,bhkd->bhqd", weights, value)
+        attended = einops.rearrange(attended, "b h s d -> b s (h d)")
+        delta = self.object_condition_output_proj(attended)
+        delta = delta * has_condition[:, None, None].astype(delta.dtype)
+        return action_tokens + self.object_condition_residual_scale * delta
 
     def _drop_object_condition(
         self, rng: at.KeyArrayLike, obs: _model.Observation, *, train: bool
@@ -179,7 +271,12 @@ class Pi0(_model.BaseModel):
         rate = self.object_condition_dropout_rate
         if not train or rate == 0.0:
             return obs
-        if obs.target_mask is None and obs.target_bbox is None and obs.target_crop is None:
+        if (
+            obs.target_mask is None
+            and obs.target_bbox is None
+            and obs.target_crop is None
+            and obs.target_point is None
+        ):
             return obs
 
         batch_size = obs.state.shape[0]
@@ -199,6 +296,7 @@ class Pi0(_model.BaseModel):
                 target_mask=apply_keep(obs.target_mask),
                 target_bbox=apply_keep(obs.target_bbox),
                 target_crop=apply_keep(obs.target_crop),
+                target_point=apply_keep(obs.target_point),
             )
 
     @at.typecheck
@@ -277,10 +375,9 @@ class Pi0(_model.BaseModel):
             action_expert_tokens = action_time_tokens
             adarms_cond = None
 
-        # Optional target-object conditioning: explicitly bias action expert tokens with a
-        # compact mask/bbox/crop embedding so the policy can focus on the intended object.
+        # Each action token retrieves the spatial/3D target information it needs.
         if object_cond is not None:
-            action_expert_tokens = action_expert_tokens + object_cond[:, None, :]
+            action_expert_tokens = self._cross_attend_object_condition(action_expert_tokens, object_cond)
 
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))

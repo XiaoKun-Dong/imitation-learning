@@ -47,6 +47,11 @@ def _freeze_vla_backbone_filter() -> Filter:
     )
 
 
+def _freeze_all_except_object_condition_filter() -> Filter:
+    """Freeze every legacy parameter and train only object cross-attention."""
+    return nnx.Not(nnx_utils.PathRegex("object_condition_.*"))
+
+
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
     """Determines the location of assets (e.g., norm stats) that will be used to set up the data pipeline.
@@ -327,8 +332,13 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             "prompt": "prompt",
         }
         if self.include_object_condition or self.object_condition_keys:
-            object_condition_keys = self.object_condition_keys or ("target_mask", "target_bbox", "target_crop")
-            invalid_keys = set(object_condition_keys) - {"target_mask", "target_bbox", "target_crop"}
+            object_condition_keys = self.object_condition_keys or (
+                "target_mask",
+                "target_bbox",
+                "target_crop",
+                "target_point",
+            )
+            invalid_keys = set(object_condition_keys) - {"target_mask", "target_bbox", "target_crop", "target_point"}
             if invalid_keys:
                 raise ValueError(f"Invalid object condition keys: {sorted(invalid_keys)}")
             repack_structure.update({key: key for key in object_condition_keys})
@@ -613,7 +623,7 @@ def _make_pi05_libero_object_mask_ablation_config(
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         freeze_filter=_freeze_vla_backbone_filter(),
         num_train_steps=30_000,
@@ -846,10 +856,44 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         freeze_filter=_freeze_vla_backbone_filter(),
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_object_cross_attention",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="local/libero_object_mask",
+            root="data/lerobot/local/libero_object_mask",
+            assets=AssetsConfig(
+                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            include_object_condition=True,
+        ),
+        batch_size=1,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-5,
+            decay_steps=1_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/dongxiaokun/baseck/pi05_libero/params"
+        ),
+        freeze_filter=_freeze_all_except_object_condition_filter(),
+        num_train_steps=1_000,
+        save_interval=250,
+        keep_period=250,
     ),
     _make_pi05_libero_object_mask_ablation_config(
         name="pi05_libero_object_none",
@@ -867,6 +911,14 @@ _CONFIGS = [
     _make_pi05_libero_object_mask_ablation_config(
         name="pi05_libero_object_crop_only",
         object_condition_keys=("target_crop",),
+    ),
+    _make_pi05_libero_object_mask_ablation_config(
+        name="pi05_libero_object_point_only",
+        object_condition_keys=("target_point",),
+    ),
+    _make_pi05_libero_object_mask_ablation_config(
+        name="pi05_libero_object_mask_point",
+        object_condition_keys=("target_mask", "target_point"),
     ),
     #
     # Fine-tuning Aloha configs.

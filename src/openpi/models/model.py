@@ -148,6 +148,9 @@ class Observation(Generic[ArrayT]):
     # x2/y2 are exclusive, so area is (x2 - x1) * (y2 - y1).
     target_bbox: at.Float[ArrayT, "b 4"] | None = None
     target_crop: at.Float[ArrayT, "b h w c"] | None = None
+    # 3D target point [x, y, z] derived from depth, in the camera/world frame
+    # chosen by the dataset conversion pipeline.
+    target_point: at.Float[ArrayT, "b 3"] | None = None
 
     # pi0-fast model specific fields.
 
@@ -187,6 +190,7 @@ class Observation(Generic[ArrayT]):
             target_mask=data.get("target_mask"),
             target_bbox=data.get("target_bbox"),
             target_crop=target_crop,
+            target_point=data.get("target_point"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -285,6 +289,7 @@ def preprocess_observation(
             target_mask=target_mask,
             target_bbox=target_bbox,
             target_crop=target_crop,
+            target_point=observation.target_point,
             token_ar_mask=observation.token_ar_mask,
             token_loss_mask=observation.token_loss_mask,
         )
@@ -316,9 +321,20 @@ class BaseModelConfig(abc.ABC):
         """Create a model with the given parameters."""
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
+        expected_params = state.to_pure_dict()
         if remove_extra_params:
-            params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+            params = ocp.transform_utils.intersect_trees(expected_params, params)
+
+        flat_expected = traverse_util.flatten_dict(expected_params)
+        flat_params = traverse_util.flatten_dict(params)
+        missing_paths = set(flat_expected) - set(flat_params)
+        legacy_object_paths = {path for path in missing_paths if path and path[0].startswith("object_condition_")}
+        if legacy_object_paths == missing_paths:
+            for path in legacy_object_paths:
+                flat_params[path] = flat_expected[path]
+            params = traverse_util.unflatten_dict(flat_params)
+
+        at.check_pytree_equality(expected=expected_params, got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 

@@ -4,8 +4,8 @@ Convert local LIBERO Object HDF5 demos to LeRobot format with GT target masks.
 This script is tailored for the pi0.5 object-mask experiment. It reads the local
 LIBERO Object HDF5 files, restores each recorded MuJoCo state in
 SegmentationRenderEnv, extracts the first BDDL obj_of_interest as the manipulated
-target, and writes target_mask / target_bbox / target_crop alongside the normal
-RGB, state, action, and task fields.
+target, and writes target_mask / target_bbox / target_crop / target_point
+alongside the normal RGB, state, action, and task fields.
 
 Usage:
 uv run examples/libero/convert_libero_data_to_lerobot.py
@@ -29,6 +29,7 @@ import numpy as np
 from PIL import Image
 from PIL import ImageDraw
 from PIL import ImageOps
+from robosuite.utils import camera_utils
 import tyro
 
 REPO_NAME = "your_hf_username/libero_object_mask"
@@ -53,6 +54,7 @@ def _make_env(bddl_file: pathlib.Path) -> SegmentationRenderEnv:
         camera_heights=IMAGE_SIZE,
         camera_widths=IMAGE_SIZE,
         camera_segmentations="instance",
+        camera_depths=True,
     )
     env.reset()
     return env
@@ -110,6 +112,16 @@ def _get_agentview_segmentation(obs: dict) -> np.ndarray:
     raise KeyError(f"Could not find agentview segmentation. Available segmentation-like keys: {seg_keys}")
 
 
+def _get_agentview_depth(obs: dict) -> np.ndarray | None:
+    for key in ("agentview_depth", "agentview_depth_image", "agentview_image_depth"):
+        if key in obs:
+            depth = np.asarray(obs[key])
+            if depth.ndim == 3:
+                depth = depth[..., 0]
+            return depth.astype(np.float32)
+    return None
+
+
 def _as_2d_segmentation(segmentation_image: np.ndarray) -> np.ndarray:
     segmentation_image = np.asarray(segmentation_image)
     if segmentation_image.ndim == 3:
@@ -149,6 +161,38 @@ def _crop_from_bbox(image: np.ndarray, bbox: np.ndarray) -> np.ndarray:
     # target_mask, and target_bbox all share the same spatial semantics.
     padded[y1:y2, x1:x2] = image[y1:y2, x1:x2]
     return padded
+
+
+def _target_point_from_depth(
+    env: SegmentationRenderEnv,
+    mask: np.ndarray,
+    bbox: np.ndarray,
+    depth: np.ndarray | None,
+) -> np.ndarray:
+    """Return approximate agentview-camera-frame target point [x, y, z] in meters."""
+    if depth is None or not np.any(mask):
+        return np.zeros((3,), dtype=np.float32)
+
+    metric_depth = camera_utils.get_real_depth_map(env.sim, depth)
+    valid_depth = metric_depth[mask]
+    valid_depth = valid_depth[np.isfinite(valid_depth) & (valid_depth > 0)]
+    if valid_depth.size == 0:
+        return np.zeros((3,), dtype=np.float32)
+
+    z = np.median(valid_depth).astype(np.float32)
+    x1, y1, x2, y2 = bbox.astype(np.float32)
+    u = (x1 + x2 - 1.0) * 0.5
+    v = (y1 + y2 - 1.0) * 0.5
+
+    height, width = depth.shape[:2]
+    fovy = float(env.sim.model.cam_fovy[env.sim.model.camera_name2id("agentview")])
+    fy = 0.5 * height / np.tan(np.deg2rad(fovy) * 0.5)
+    fx = fy
+    cx = (width - 1.0) * 0.5
+    cy = (height - 1.0) * 0.5
+    x = (u - cx) / fx * z
+    y = (v - cy) / fy * z
+    return np.asarray([x, y, z], dtype=np.float32)
 
 
 def _save_debug_overlay(
@@ -230,6 +274,11 @@ def _create_dataset(repo_name: str, output_root: pathlib.Path) -> LeRobotDataset
                 "shape": (IMAGE_SIZE, IMAGE_SIZE, 3),
                 "names": ["height", "width", "channel"],
             },
+            "target_point": {
+                "dtype": "float32",
+                "shape": (3,),
+                "names": ["x_y_z_agentview_camera"],
+            },
         },
         image_writer_threads=10,
         image_writer_processes=5,
@@ -279,6 +328,8 @@ def main(
                     seg = _get_agentview_segmentation(obs)
                     target_mask = _target_mask_from_segmentation(env, seg)
                     target_bbox = _bbox_from_mask(target_mask)
+                    target_depth = _get_agentview_depth(obs)
+                    target_point = _target_point_from_depth(env, target_mask, target_bbox, target_depth)
                     image = demo["obs/agentview_rgb"][frame_idx]
                     target_crop = _crop_from_bbox(image, target_bbox)
                     if debug_overlay_dir is not None and debug_saved < debug_frames_per_task:
@@ -296,6 +347,7 @@ def main(
                             "target_mask": np.repeat(target_mask[..., None], 3, axis=-1).astype(np.uint8) * 255,
                             "target_bbox": target_bbox,
                             "target_crop": target_crop,
+                            "target_point": target_point,
                         }
                     )
                 dataset.save_episode()
@@ -303,7 +355,7 @@ def main(
         env.close()
 
     if push_to_hub:
-        dataset.push_to_hub(tags=["libero", "panda", "object-mask"], private=False, push_videos=True)
+        dataset.push_to_hub(tags=["libero", "panda", "object-mask", "object-3d"], private=False, push_videos=True)
 
 
 if __name__ == "__main__":
