@@ -69,3 +69,33 @@ checkpoint was trained in openpi with the `pi05_libero` config.
 | Model | Libero Spatial | Libero Object | Libero Goal | Libero 10 | Average |
 |-------|---------------|---------------|-------------|-----------|---------|
 | π0.5 @ 30k (finetuned) | 98.8 | 98.2 | 98.0 | 92.4 | 96.85
+
+## LIBERO-plus
+
+LIBERO-plus is loaded in an isolated process so it does not replace the original editable LIBERO package used for
+training. Set it up once (the asset archive is about 6.4 GB and supports resuming):
+
+```bash
+uv sync
+bash examples/libero/setup_libero_plus.sh
+```
+
+Start the policy server in one terminal as usual. In a second terminal, run a small deterministic Objects Layout
+pilot on `libero_object`:
+
+```bash
+MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 \
+uv run python examples/libero/run_libero_plus.py \
+  --args.task-suite-name libero_object \
+  --args.object-condition 3d \
+  --args.task-category "Objects Layout" \
+  --args.max-tasks 20 \
+  --args.num-trials-per-task 1 \
+  --args.seed 7 \
+  --args.video-out-path data/libero_plus/videos/object_3d
+```
+
+The wrapper defaults to the same category, task count, and one trial when those flags are omitted. Use identical
+selection flags and seed for the baseline, changing only `--args.object-condition` and the output directory. Per-episode
+results are written to `metrics.jsonl`. Some task definitions are missing in the upstream checkout; unavailable tasks
+are skipped deterministically and reported in the log.

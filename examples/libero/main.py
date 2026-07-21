@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import pathlib
+import random
 from typing import Literal
 
 import imageio
@@ -41,6 +42,12 @@ class Args:
     object_condition: Literal["none", "3d"] = "3d"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    task_category: str | None = None  # LIBERO-plus perturbation category, e.g. "Objects Layout".
+    difficulty_level: int | None = None  # LIBERO-plus difficulty level (1-5).
+    task_name_contains: str | None = None
+    shuffle_tasks: bool = False
+    max_tasks: int | None = None
+    task_ids: tuple[int, ...] = ()  # Optional 1-based benchmark task IDs.
 
     #################################################################################################################
     # Utils
@@ -57,8 +64,9 @@ def eval_libero(args: Args) -> None:
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
-    num_tasks_in_suite = task_suite.n_tasks
+    selected_tasks = _select_tasks(args, task_suite)
     logging.info(f"Task suite: {args.task_suite_name}")
+    logging.info("Selected %d / %d tasks", len(selected_tasks), task_suite.n_tasks)
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
     metrics_path = pathlib.Path(args.video_out_path) / "metrics.jsonl"
@@ -82,7 +90,7 @@ def eval_libero(args: Args) -> None:
     # Start evaluation
     total_episodes, total_successes = 0, 0
     total_target_grasps, total_wrong_object_grasps = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id, task_metadata in tqdm.tqdm(selected_tasks):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -110,8 +118,9 @@ def eval_libero(args: Args) -> None:
             replay_images = []
             target_grasped = False
             wrong_object_grasped = False
+            done = False
 
-            logging.info(f"Starting episode {task_episodes+1}...")
+            logging.info(f"Starting episode {task_episodes + 1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -164,9 +173,9 @@ def eval_libero(args: Args) -> None:
 
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
-                        assert (
-                            len(action_chunk) >= args.replan_steps
-                        ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                        assert len(action_chunk) >= args.replan_steps, (
+                            f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                        )
                         action_plan.extend(action_chunk[: args.replan_steps])
 
                     action = action_plan.popleft()
@@ -200,14 +209,18 @@ def eval_libero(args: Args) -> None:
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{episode_idx:02d}_{suffix}.mp4",
+                pathlib.Path(args.video_out_path)
+                / f"rollout_task_{task_id + 1:04d}_{task_segment}_{episode_idx:02d}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
 
             episode_metrics = {
                 "task_id": task_id,
+                "benchmark_task_id": task_id + 1,
                 "task": task_description,
+                "category": task_metadata.get("category"),
+                "difficulty_level": task_metadata.get("difficulty_level"),
                 "episode": episode_idx,
                 "success": bool(done),
                 "target_grasped": target_grasped,
@@ -248,12 +261,72 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Total episodes: {total_episodes}")
 
 
+def _select_tasks(args: Args, task_suite) -> list[tuple[int, dict]]:
+    """Select a deterministic, available subset from LIBERO or LIBERO-plus."""
+    classification_path = pathlib.Path(benchmark.__file__).with_name("task_classification.json")
+    metadata_by_index: dict[int, dict] = {}
+    if classification_path.exists():
+        classification = json.loads(classification_path.read_text(encoding="utf-8"))
+        rows = classification.get(args.task_suite_name, [])
+        metadata_by_index = {int(row["id"]) - 1: row for row in rows}
+    elif args.task_category is not None or args.difficulty_level is not None:
+        raise ValueError("Task category/difficulty filters require the LIBERO-plus benchmark package")
+
+    if args.task_ids:
+        indices = [task_id - 1 for task_id in args.task_ids]
+        invalid_ids = [task_id for task_id in args.task_ids if not 1 <= task_id <= task_suite.n_tasks]
+        if invalid_ids:
+            raise ValueError(f"Task IDs out of range 1..{task_suite.n_tasks}: {invalid_ids}")
+    else:
+        indices = list(range(task_suite.n_tasks))
+
+    if args.task_category is not None:
+        category = args.task_category.casefold()
+        indices = [
+            index for index in indices if metadata_by_index.get(index, {}).get("category", "").casefold() == category
+        ]
+    if args.difficulty_level is not None:
+        indices = [
+            index
+            for index in indices
+            if metadata_by_index.get(index, {}).get("difficulty_level") == args.difficulty_level
+        ]
+    if args.task_name_contains is not None:
+        needle = args.task_name_contains.casefold()
+        indices = [
+            index
+            for index in indices
+            if needle in metadata_by_index.get(index, {}).get("name", task_suite.get_task(index).name).casefold()
+        ]
+    if args.shuffle_tasks:
+        random.Random(args.seed).shuffle(indices)
+
+    selected = []
+    missing_bddl = 0
+    bddl_root = pathlib.Path(get_libero_path("bddl_files"))
+    for index in indices:
+        task = task_suite.get_task(index)
+        bddl_path = bddl_root / task.problem_folder / task.bddl_file
+        if not bddl_path.exists():
+            missing_bddl += 1
+            continue
+        selected.append((index, metadata_by_index.get(index, {})))
+        if args.max_tasks is not None and len(selected) >= args.max_tasks:
+            break
+
+    if missing_bddl:
+        logging.warning("Skipped %d selected tasks with missing BDDL files", missing_bddl)
+    if not selected:
+        raise ValueError("No available tasks matched the requested filters")
+    return selected
+
+
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     env_args = {
-        "bddl_file_name": task_bddl_file,
+        "bddl_file_name": str(task_bddl_file),
         "camera_heights": resolution,
         "camera_widths": resolution,
         "camera_segmentations": "instance",
@@ -278,9 +351,7 @@ def _get_target_object_condition(env, obs, image: np.ndarray, resize_size: int):
     target_point = _target_point_from_depth(env, raw_target_mask, raw_target_bbox, depth)
 
     mask_rgb = np.repeat(raw_target_mask[..., None], 3, axis=-1).astype(np.uint8) * 255
-    target_mask = image_tools.resize_with_pad(
-        mask_rgb, resize_size, resize_size, method=Image.Resampling.NEAREST
-    )
+    target_mask = image_tools.resize_with_pad(mask_rgb, resize_size, resize_size, method=Image.Resampling.NEAREST)
     target_mask = target_mask[..., 0] > 127
     target_bbox = _bbox_from_mask(target_mask)
     target_crop = _crop_from_bbox(image, target_bbox)
