@@ -39,7 +39,7 @@ class Args:
     task_suite_name: str = (
         "libero_object"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
-    object_condition: Literal["none", "3d"] = "3d"
+    object_condition: Literal["none", "2d", "3d"] = "3d"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
     task_category: str | None = None  # LIBERO-plus perturbation category, e.g. "Objects Layout".
@@ -158,18 +158,23 @@ def eval_libero(args: Args) -> None:
                             ),
                             "prompt": str(task_description),
                         }
-                        if args.object_condition == "3d":
+                        if args.object_condition != "none":
                             target_mask, target_bbox, target_crop, target_point = _get_target_object_condition(
-                                env, obs, img, args.resize_size
+                                env,
+                                obs,
+                                img,
+                                args.resize_size,
+                                include_point=args.object_condition == "3d",
                             )
                             element.update(
                                 {
                                     "target_mask": target_mask,
                                     "target_bbox": target_bbox,
                                     "target_crop": target_crop,
-                                    "target_point": target_point,
                                 }
                             )
+                            if args.object_condition == "3d":
+                                element["target_point"] = target_point
 
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
@@ -337,7 +342,7 @@ def _get_libero_env(task, resolution, seed):
     return env, task_description
 
 
-def _get_target_object_condition(env, obs, image: np.ndarray, resize_size: int):
+def _get_target_object_condition(env, obs, image: np.ndarray, resize_size: int, *, include_point: bool = True):
     """Build target object mask/bbox/crop in the same frame as observation/image.
 
     LIBERO's BDDL obj_of_interest may include destination objects. For LIBERO Object,
@@ -347,8 +352,10 @@ def _get_target_object_condition(env, obs, image: np.ndarray, resize_size: int):
     seg = np.ascontiguousarray(seg[::-1, ::-1])
     raw_target_mask = _target_mask_from_segmentation(env, seg)
     raw_target_bbox = _bbox_from_mask(raw_target_mask)
-    depth = np.ascontiguousarray(_get_agentview_depth(obs)[::-1, ::-1])
-    target_point = _target_point_from_depth(env, raw_target_mask, raw_target_bbox, depth)
+    target_point = None
+    if include_point:
+        depth = np.ascontiguousarray(_get_agentview_depth(obs)[::-1, ::-1])
+        target_point = _target_point_from_depth(env, raw_target_mask, raw_target_bbox, depth)
 
     mask_rgb = np.repeat(raw_target_mask[..., None], 3, axis=-1).astype(np.uint8) * 255
     target_mask = image_tools.resize_with_pad(mask_rgb, resize_size, resize_size, method=Image.Resampling.NEAREST)

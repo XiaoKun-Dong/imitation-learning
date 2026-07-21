@@ -12,13 +12,19 @@ RGB 图像 + 语言指令 + 本体状态
 目标物 3D point [x, y, z]
         |
         v
-轻量 object encoder
+2D patch encoder + 单点 geometry encoder
         |
         v
-只注入 pi0.5 action expert
+通过 cross-attention 只注入 pi0.5 action expert token
 ```
 
-当前阶段先采用轻量 3D object-centric 表示：不引入完整点云、不改 PaliGemma 图像/语言主干，只把 depth 派生出的目标点作为 object encoder 的额外几何特征。目标是在 `libero_object` 上验证 2D 目标物显式条件 + 3D 位置信息是否提升目标定位、相似物区分和接近抓取阶段的动作稳定性。
+当前实现是“2D object tokens + 单个 3D 代表点”，不是 point-cloud 模型：不改 PaliGemma 图像/语言主干，
+把 mask/crop 下采样成 `16x16` patch token，并将 depth 派生的目标点 `[x,y,z]` 与 bbox、mask moments
+组成一个 geometry token。action expert 的噪声动作 token 通过多头 cross-attention 读取这些 object token。
+
+这里的 `target_point` 是 mask 内深度中位数配合 bbox 中心反投影得到的相机系代表点，只表达目标的大致中心位置；
+它不保留目标表面形状、点级局部几何、朝向和遮挡结构。因此代码中的 `object_condition="3d"` 是历史 CLI 名称，
+准确含义应理解为 `2D + single-point 3D condition`。
 
 ## 已完成
 
@@ -32,8 +38,11 @@ RGB 图像 + 语言指令 + 本体状态
 - [x] `target_bbox` 会按 RGB 图像相同的 resize-with-pad 几何关系同步变换。
 - [x] 明确并固定 `target_bbox` 约定：绝对像素坐标 `[x1, y1, x2, y2)`，x2/y2 为 exclusive，不是 0-1 归一化坐标。
 - [x] `target_point` 表示 depth 派生的 3D 目标点 `[x, y, z]`，不随图像 resize 变换。
-- [x] `pi0.py` 中已将原来的 6 维全局均值 object condition 替换为轻量空间 object encoder。
-- [x] object embedding 只注入 action expert，不改 PaliGemma 图像/语言主干。
+- [x] `pi0.py` 中已将原来的全局均值 object condition 替换为 `16x16` 空间 patch encoder。
+- [x] bbox + mask moments + `target_point` 被编码为一个 geometry token。
+- [x] action expert token 通过 8-head cross-attention 读取 object patch/geometry token，不改 PaliGemma 图像/语言主干。
+- [x] cross-attention output projection 使用 zero init，初始时严格保持 legacy policy 输出不变。
+- [x] object residual 使用固定 `0.1` scale 限幅。
 - [x] 增加 mask dropout，使训练在 mask 缺失或轻微错误时更稳。
 - [x] 给 `target_mask`、`target_bbox`、`target_crop`、`target_point` 增加 shape、dtype、resize 和 bbox 约定单元测试。
 
@@ -64,7 +73,8 @@ RGB 图像 + 语言指令 + 本体状态
   - `pi05_libero_object_point_only`：point only
   - `pi05_libero_object_mask_point`：mask + point
   - `pi05_libero_object_mask`：mask + bbox + crop + point
-- [x] 增加冻结配置：冻结 VLA 图像/语言主干，只训练 action expert、action adapter 和 object encoder。
+- [x] `pi05_libero_object_mask` 增加冻结配置：冻结 VLA 图像/语言主干，训练 action expert 和 object encoder。
+- [x] `pi05_libero_object_cross_attention` 冻结全部 legacy 参数，只训练 `object_condition_*` cross-attention/encoder 参数。
 - [x] 修正 `pi05_base` 加载新增 object encoder 时的权重子集校验问题。
 - [x] 计算 `pi05_libero_object_mask` norm stats，并随 smoke checkpoint 保存。
 - [x] 单卡 smoke 训练使用 `--ema-decay None` 规避 EMA 额外显存占用。
@@ -161,9 +171,9 @@ Object adapter only 结果：
   退化 10 条、相同 20 条。冻结 legacy 参数仍不足以保持性能，无约束 object residual 本身会显著扰动成熟策略。
 - [ ] 下一轮给 object residual 增加幅度约束（固定小 scale 或有界 gate），并考虑加入保持官方动作输出的蒸馏损失。
 
-## 3D 升级收尾
+## 单点 3D 升级收尾
 
-当前已从纯 2D object encoder 升级为轻量 3D object encoder。下面是还需要补齐的数据侧和验证工作。
+当前已从纯 2D object encoder 升级为带单点几何条件的 object encoder，但尚未引入 point cloud。
 
 ### 数据侧
 
@@ -185,33 +195,134 @@ Object adapter only 结果：
 2026-07-16 3D smoke 训练通过：batch 中 `target_point` shape 为 `(1, 3)`，完成 2 个训练 step，
 并成功写出 step 1 的 `params`、`train_state` 和 Orbax metadata。
 
-### 暂不做的输入升级
+### 2026-07-21 代码复核
 
-- [ ] 暂不生成完整 3D point cloud。
-- [ ] 暂不做 3D object token。
-- [ ] 暂不引入 DP3 / point-wise 3D encoder。
+- [x] 确认训练和在线评测都使用同一套 `get_real_depth_map + mask + bbox center` 单点提取语义。
+- [x] 确认当前数据 schema 只有 `target_point: float32[3]`，没有 `target_points: float32[N,3/6]`。
+- [x] 确认当前 geometry encoder 只接收 bbox、mask moments 和单点 `[x,y,z]`。
+- [x] 确认当前 cross-attention 的 key/value token 是 2D crop/mask patch token + 1 个 geometry token，
+  不是 point-cloud token。
+- [x] 确认 `pi05_libero_object_cross_attention` 只训练 `object_condition_*`，官方 pi0.5 LIBERO 参数保持冻结。
+- [ ] `target_point` 当前用 bbox 中心作为 `(u,v)`，而不是 mask 像素的深度加权 3D centroid；需要作为单点 ablation 的已知近似记录。
+- [ ] 相机系单点没有外参变换；Camera Viewpoints 扰动下不能直接解释为相机不变 3D 表示。
 
-### 暂不做的结构升级
+### LIBERO-P 初步验证
 
-- [ ] 暂不做 mask-to-visual-token spatial attention bias。
-- [ ] 暂不把 `target_mask / target_crop` 切成 patch-level object tokens。
-- [ ] 暂不让 action expert 通过 cross-attention 显式读取 object patch tokens。
+- [x] 接入 LIBERO-P task category、difficulty、task-id、名称过滤和确定性随机抽样。
+- [x] 在 20 个 `add_*` 干扰物任务上完成配对评测：Base `18/20`，单点 3D `17/20`，未显示收益。
+- [x] 在 20 个多目标、多位移等级 `_level*` 任务上完成配对评测：Base `15/20`，单点 3D `16/20`。
+- [x] 目标位移组共同成功的 14 项中，单点 3D 有 12 项步数更少，平均少 `12.1` 步。
+- [x] 训练集首帧目标位置近似固定：5/10 个任务无可测变化，其余主要为毫米级，最大范围约 `2 cm`；
+  LIBERO-P Level 2-5 中位位移约 `4.5-9.7 cm`，可作为目标位置分布偏移测试。
+- [ ] 使用 seed `7/42/123` 扩展到至少 60 个严格配对回合，并按位移 Level 1-5 报告结果。
+- [ ] 当前结果只支持“已见物体/已见任务下的位置扰动鲁棒性”解释，不能宣称未见物体或新技能泛化。
+
+## 当前优先级：先验证 2D Object-Centric
+
+Point cloud 与单点 3D 升级暂时冻结。当前主问题不是“更多 3D 几何是否更强”，而是先证明在成熟
+`pi05_libero` 策略上加入显式 2D 目标条件是否带来稳定、可复现、可解释的收益。
+
+### 公平训练配置
+
+- [x] 新增 `pi05_libero_object_2d_cross_attention`。
+- [x] 从同一个官方 `pi05_libero` checkpoint 初始化，而不是从未做 LIBERO 微调的 `pi05_base` 初始化。
+- [x] 复用官方 `physical-intelligence/libero` norm stats。
+- [x] 冻结全部 legacy policy 参数，只训练 `object_condition_*` encoder/cross-attention。
+- [x] 2D 训练输入严格限制为 `target_mask + target_bbox + target_crop`，不 repack `target_point`。
+- [x] 在线评测增加 `--args.object-condition 2d`，不向 server 发送 `target_point`。
+- [ ] Base 与 2D 使用完全相同的 task IDs、rollout seed、replan steps 和 episode horizon。
+
+旧的 `pi05_libero_object_mask_only/crop_only/bbox_only` 从 `pi05_base` 初始化并解冻 action expert，不能直接与
+官方 `pi05_libero` 组成公平主实验；它们只保留为早期探索配置，不用于核心结论。
+
+### 2D 优点假设
+
+- [ ] **目标定位**：目标发生平面位移时，mask/bbox 提供明确的新位置，降低搜索和接近阶段失败。
+- [ ] **抗干扰物**：增加相似或无关物体时，显式 mask/crop 降低 wrong-object grasp。
+- [ ] **动作效率**：共同成功任务中减少接近目标前的无效动作和总完成步数。
+- [ ] **位移退化更慢**：随 LIBERO-P target displacement Level 1-5 增大，2D 的成功率下降斜率小于 Base。
+- [ ] **无扰动不退化**：原始 LIBERO Object 上性能应接近官方 Base，证明 residual 没有破坏成熟策略。
+
+### 最小证据链
+
+- [ ] 训练 `pi05_libero_object_2d_cross_attention`，先保存 `250/500/750/999` 四个 checkpoint。
+- [ ] 用原始 LIBERO Object 小样本筛选 checkpoint，淘汰明显破坏 Base 行为的版本。
+- [ ] 主评测 A：LIBERO-P `_level*` 目标位移，覆盖多目标和 Level 1-5。
+- [ ] 主评测 B：LIBERO-P `add_*` 干扰物增加，覆盖多目标而非连续单任务。
+- [ ] 保真评测：原始 LIBERO Object，确认 2D 模型相对官方 Base 的性能保持。
+- [ ] 至少使用 seed `7/42/123`，每组累计不少于 60 个严格配对回合。
+- [ ] 报告 success、target grasp、post-grasp failure、wrong-object grasp 和成功步数。
+- [ ] 使用配对 task-level bootstrap CI 或 exact McNemar，而不是只比较点估计。
+
+### 必要消融
+
+- [ ] 2D combined：mask + bbox + crop，作为当前主模型。
+- [ ] Mask + bbox：去掉 RGB crop，判断收益来自位置还是目标外观。
+- [ ] Crop only：判断目标外观提示是否足够。
+- [ ] Oracle mask corruption：平移/膨胀/随机漏检，测试对分割误差的敏感性。
+- [ ] Single-point 3D 只作为附加参考，不作为当前主线，也不继续升级结构。
+
+### 成功判据
+
+- [ ] 原始 LIBERO Object 不出现明显性能退化。
+- [ ] 在至少两个 seed 上，目标位移或干扰物任务的配对成功率方向一致。
+- [ ] wrong-object grasp 或 target-grasp failure 至少一项稳定下降。
+- [ ] 共同成功任务的完成步数不显著变差。
+- [ ] 优势能够对应到预先声明的失败类型，而不是只依赖少数偶然 rollout。
+
+## Point Cloud 下一阶段（冻结）
+
+只有在上述 2D 证据链完成、且能明确指出 2D 表示的失败边界后，才恢复以下工作。
+
+### 数据表示
+
+- [ ] 从 agentview metric depth + target mask 反投影目标表面所有有效像素，而不是只取一个 bbox 中心点。
+- [ ] 固定采样 `N=128` 或 `N=256` 个点，优先使用 farthest-point sampling；点不足时 padding 并提供 validity mask。
+- [ ] 第一版点特征使用相机系 `XYZ`；第二版 ablation 再加入对应像素 `RGB`，形成 `XYZRGB`。
+- [ ] 对点云做以目标 centroid 为中心的局部归一化，同时单独保留全局 centroid，避免丢失绝对抓取位置。
+- [ ] 明确相机系与机器人 base/world 系两套方案；若测试 Camera Viewpoints，优先用相机外参转换到机器人 base 系。
+- [ ] LeRobot schema 增加 `target_points: float32[N,3/6]` 和 `target_points_mask: bool[N]`。
+- [ ] 重新转换数据并扫描 NaN/Inf、有效点数、空间范围、padding 比例和训练/评测坐标系一致性。
+
+### 模型结构
+
+- [ ] 增加轻量 PointNet/point-wise MLP：逐点编码后保留 `K` 个 point token，不只做全局 max pooling。
+- [ ] 将 point token 与现有 2D patch token、geometry token 拼接，复用 action-token cross-attention。
+- [ ] 为 2D patch、point、geometry 增加 modality/type embedding，避免三种 token 语义混淆。
+- [ ] 保持 output projection zero init 和 residual scale，确保从官方 checkpoint 初始化时仍是严格 no-op。
+- [ ] 第一阶段继续冻结 legacy policy，只训练 point encoder 与 object cross-attention；确认稳定后再考虑解冻 action expert 顶层。
+
+### Point Cloud 对照实验
+
+- [ ] Base：官方 `pi05_libero`，无 object condition。
+- [ ] 2D：mask/crop patch + bbox/mask moments，不使用任何 depth。
+- [ ] Single-point 3D：当前实现，2D + centroid point。
+- [ ] Point cloud XYZ：2D + `N x XYZ`。
+- [ ] Point cloud XYZRGB：2D + `N x XYZRGB`。
+- [ ] 所有组共享 checkpoint、norm stats、训练样本数、seed、冻结策略和评测 task IDs。
+- [ ] 主评测使用 LIBERO-P target displacement Level 1-5；辅助评测使用 Objects Layout distractors 和 Camera Viewpoints。
+- [ ] 除 success 外报告 target-grasp、post-grasp failure、wrong-object grasp、成功步数和按位移等级退化曲线。
+
+### 当前仍不修改
+
 - [ ] 暂不改 pi0.5 的 PaliGemma 图像/语言主干 token 流。
-- [ ] 暂不替换当前轻量 MLP object encoder；如果 MLP 不够，再考虑小 CNN、共享 SigLIP crop encoder，或 object patch token encoder。
+- [ ] 暂不做 mask-to-PaliGemma-visual-token spatial attention bias。
+- [ ] 暂不引入 DP3 的完整 policy/action backbone；先只借鉴 point encoder。
 
 ### 暂不做的 ManiFlow 风格 action backbone 升级
 
 - [ ] 暂不把 pi0.5 action expert 改成 DiT-X。
 - [ ] 暂不增加 adaptive cross-attention。
 - [ ] 暂不增加 AdaLN-Zero 的 scale / shift / gate 调制。
-- [ ] 暂不在 object condition 注入处做 zero-init gate；后续如果 object embedding 过强或训练不稳，再考虑 gate 从 0 初始化。
+- [x] object cross-attention output projection 已 zero init，并使用固定 `0.1` residual scale。
+- [ ] 暂不增加可学习 AdaLN-Zero gate；若固定 scale 仍不稳，再考虑 gate 从 0 初始化。
 - [ ] 暂不改变 pi0.5 现有 flow matching 训练目标。
 - [ ] 暂不加入 ManiFlow 风格 consistency flow training。
 - [ ] 暂不为了 1-2 step action generation 改采样器；当前先沿用 pi0.5 原始 `sample_actions` 流程。
 
 ### 后续可借鉴的 ManiFlow 启发
 
-- [ ] 如果全局 object embedding 收益有限，优先尝试保留 `mask/crop` 空间结构的 object patch tokens。
+- [x] 已保留 `mask/crop` 的 `16x16` 空间 patch token，并由 action token cross-attention 读取。
 - [ ] 如果 object input 对不同动作阶段影响不稳定，考虑用 timestep + proprioception 生成 gate，动态控制 object condition 强度。
 - [ ] 如果少步推理质量成为瓶颈，再研究 consistency flow training，而不是在当前 2D mask 主实验里同步修改训练目标。
 - [ ] 如果要写后续工作，可以把当前方法定位为 ManiFlow/DiT-X 风格多模态 action conditioning 的轻量前置验证。

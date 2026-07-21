@@ -219,6 +219,17 @@ def test_pi05_object_cross_attention_only_trains_object_condition():
     assert any("object_condition_output_proj" in path for path in trainable_paths)
 
 
+def test_pi05_object_2d_cross_attention_excludes_target_point():
+    config = _train_config.get_config("pi05_libero_object_2d_cross_attention")
+
+    assert config.data.object_condition_keys == ("target_mask", "target_bbox", "target_crop")
+    abstract_model = nnx.eval_shape(config.model.create, jax.random.key(4))
+    trainable_state = nnx.state(abstract_model, config.trainable_filter).flat_state()
+    trainable_paths = ["/".join(str(part) for part in path) for path in trainable_state]
+    assert trainable_paths
+    assert all("object_condition_" in path for path in trainable_paths)
+
+
 def test_pi05_loads_legacy_checkpoint_without_object_encoder():
     config = pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False)
     abstract_model = nnx.eval_shape(config.create, jax.random.key(0))

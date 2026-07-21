@@ -343,11 +343,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                 raise ValueError(f"Invalid object condition keys: {sorted(invalid_keys)}")
             repack_structure.update({key: key for key in object_condition_keys})
 
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(repack_structure)
-            ]
-        )
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
@@ -887,9 +883,39 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/home/dongxiaokun/baseck/pi05_libero/params"
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_libero/params"),
+        freeze_filter=_freeze_all_except_object_condition_filter(),
+        num_train_steps=1_000,
+        save_interval=250,
+        keep_period=250,
+    ),
+    TrainConfig(
+        name="pi05_libero_object_2d_cross_attention",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
         ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="local/libero_object_mask",
+            root="data/lerobot/local/libero_object_mask",
+            assets=AssetsConfig(
+                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            object_condition_keys=("target_mask", "target_bbox", "target_crop"),
+        ),
+        batch_size=1,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-5,
+            decay_steps=1_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_libero/params"),
         freeze_filter=_freeze_all_except_object_condition_filter(),
         num_train_steps=1_000,
         save_interval=250,
