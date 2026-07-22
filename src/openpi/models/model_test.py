@@ -1,4 +1,5 @@
 from flax import nnx
+from flax import traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -150,7 +151,35 @@ def test_preprocess_target_object_shapes_and_dtypes():
     assert processed.target_point.dtype == jnp.float32
     assert jnp.allclose(processed.target_point, obs.target_point)
     assert jnp.allclose(processed.target_bbox[0], jnp.asarray([11.2, 78.4, 33.6, 112.0], dtype=jnp.float32))
-    assert jnp.allclose(processed.target_bbox[1], jnp.asarray([0.0, 56.0, 0.0, 56.0], dtype=jnp.float32))
+    assert jnp.allclose(processed.target_bbox[1], jnp.zeros((4,), dtype=jnp.float32))
+
+
+def test_preprocess_synchronizes_base_image_and_object_geometric_augmentation():
+    batch_size = 2
+    target_mask = jnp.zeros((batch_size, 224, 224), dtype=jnp.bool_).at[:, 60:120, 80:150].set(True)
+    target_crop = jnp.repeat(target_mask[..., None], 3, axis=-1).astype(jnp.float32)
+    base_image = target_crop * 2.0 - 1.0
+    obs = _model.Observation(
+        images={
+            "base_0_rgb": base_image,
+            "left_wrist_0_rgb": jnp.zeros_like(base_image),
+            "right_wrist_0_rgb": jnp.zeros_like(base_image),
+        },
+        image_masks={key: jnp.ones((batch_size,), dtype=jnp.bool_) for key in _model.IMAGE_KEYS},
+        state=jnp.zeros((batch_size, 8), dtype=jnp.float32),
+        target_mask=target_mask,
+        target_bbox=jnp.asarray([[80, 60, 150, 120]] * batch_size, dtype=jnp.float32),
+        target_crop=target_crop,
+    )
+
+    processed = _model.preprocess_observation(jax.random.key(10), obs, train=True)
+    repeated = _model.preprocess_observation(jax.random.key(10), obs, train=True)
+
+    assert jnp.allclose(processed.images["base_0_rgb"], processed.target_crop * 2.0 - 1.0, atol=1e-5)
+    assert jnp.array_equal(processed.target_bbox, _model._bbox_from_target_mask(processed.target_mask))
+    assert jnp.array_equal(processed.target_mask, repeated.target_mask)
+    assert jnp.allclose(processed.target_crop, repeated.target_crop)
+    assert not jnp.array_equal(processed.target_mask, target_mask)
 
 
 def test_observation_from_dict_converts_uint8_target_crop_to_float():
@@ -230,8 +259,86 @@ def test_pi05_object_2d_cross_attention_excludes_target_point():
     assert all("object_condition_" in path for path in trainable_paths)
 
 
+def test_pi05_object_2d_step1_enables_encoder_and_gate():
+    config = _train_config.get_config("pi05_libero_object_2d_step1")
+
+    assert config.data.object_condition_keys == ("target_mask", "target_bbox", "target_crop")
+    assert config.model.object_condition_encoder_layers == 2
+    assert config.model.object_condition_use_gate
+    assert jnp.isclose(jax.nn.sigmoid(config.model.object_condition_gate_init), 0.01798621)
+
+    abstract_model = nnx.eval_shape(config.model.create, jax.random.key(5))
+    traverse_util.flatten_dict(nnx.state(abstract_model).to_pure_dict(), sep="/")
+    trainable_state = nnx.state(abstract_model, config.trainable_filter).flat_state()
+    trainable_paths = ["/".join(str(part) for part in path) for path in trainable_state]
+    assert trainable_paths
+    assert all("object_condition_" in path for path in trainable_paths)
+    assert any("object_condition_encoder_qkv_projs" in path for path in trainable_paths)
+    assert any("object_condition_encoder_mlp_in" in path for path in trainable_paths)
+    assert any("object_condition_gate" in path for path in trainable_paths)
+
+
+def test_pi05_object_2d_legacy_config_keeps_step1_disabled():
+    config = _train_config.get_config("pi05_libero_object_2d_cross_attention")
+
+    assert config.model.object_condition_encoder_layers == 0
+    assert not config.model.object_condition_use_gate
+
+
+def test_pi0_step1_object_encoder_masks_tokens_and_starts_as_noop():
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=10,
+        discrete_state_input=False,
+        object_condition_encoder_layers=2,
+        object_condition_use_gate=True,
+    )
+    model = config.create(jax.random.key(6))
+    obs = config.fake_obs(batch_size=1)
+    target_mask = jnp.zeros((1, 224, 224), dtype=jnp.bool_).at[:, 64:128, 80:144].set(True)
+    target_crop = jnp.repeat(target_mask[..., None], 3, axis=-1).astype(jnp.float32)
+    obs = obs.replace(
+        target_mask=target_mask,
+        target_bbox=jnp.asarray([[80.0, 64.0, 144.0, 128.0]], dtype=jnp.float32),
+        target_crop=target_crop,
+        target_point=None,
+    )
+
+    object_condition = model._embed_object_condition(obs)
+    assert object_condition is not None
+    object_tokens, object_token_mask, has_condition = object_condition
+    assert object_tokens.shape == (1, 257, 1024)
+    assert object_token_mask.shape == (1, 257)
+    assert jnp.all(has_condition)
+    assert jnp.all(jnp.isfinite(object_tokens))
+    assert jnp.allclose(object_tokens * (~object_token_mask[..., None]), 0.0)
+    assert jnp.isclose(jax.nn.sigmoid(model.object_condition_gate.value), 0.01798621)
+
+    action_tokens = jax.random.normal(jax.random.key(7), (1, config.action_horizon, 1024))
+    conditioned = model._cross_attend_object_condition(action_tokens, object_condition)
+    assert jnp.allclose(conditioned, action_tokens)
+
+    empty_obs = obs.replace(
+        target_mask=jnp.zeros_like(target_mask),
+        target_bbox=jnp.zeros((1, 4), dtype=jnp.float32),
+        target_crop=jnp.zeros_like(target_crop),
+    )
+    empty_condition = model._embed_object_condition(empty_obs)
+    assert empty_condition is not None
+    empty_tokens, _, empty_has_condition = empty_condition
+    assert jnp.all(jnp.isfinite(empty_tokens))
+    assert not jnp.any(empty_has_condition)
+    assert jnp.allclose(model._cross_attend_object_condition(action_tokens, empty_condition), action_tokens)
+
+
 def test_pi05_loads_legacy_checkpoint_without_object_encoder():
-    config = pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False)
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=10,
+        discrete_state_input=False,
+        object_condition_encoder_layers=2,
+        object_condition_use_gate=True,
+    )
     abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
     _, state = nnx.split(abstract_model)
     legacy_params = state.to_pure_dict()
@@ -244,6 +351,27 @@ def test_pi05_loads_legacy_checkpoint_without_object_encoder():
     loaded_state = nnx.state(loaded_model).to_pure_dict()
     assert "object_condition_query_proj" in loaded_state
     assert "object_condition_output_proj" in loaded_state
+    assert "object_condition_encoder_qkv_projs" in loaded_state
+    assert "object_condition_gate" in loaded_state
+
+
+def test_pi05_rejects_object_checkpoint_with_incompatible_step1_structure():
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=10,
+        discrete_state_input=False,
+        object_condition_encoder_layers=2,
+        object_condition_use_gate=True,
+    )
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    _, state = nnx.split(abstract_model)
+    old_object_params = state.to_pure_dict()
+    for name in list(old_object_params):
+        if name.startswith("object_condition_encoder_") or name == "object_condition_gate":
+            old_object_params.pop(name)
+
+    with pytest.raises(ValueError, match="Object-condition checkpoint is missing parameters"):
+        config.load(old_object_params)
 
 
 def test_pi0_fast_model():

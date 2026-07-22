@@ -54,12 +54,13 @@ def main() -> None:
 
     defaults = {
         "--args.task-category": "Objects Layout",
-        "--args.max-tasks": "20",
         "--args.num-trials-per-task": "1",
     }
     for flag, value in defaults.items():
         if flag not in sys.argv:
             sys.argv.extend([flag, value])
+    if "--args.max-tasks" not in sys.argv and "--args.task-ids" not in sys.argv:
+        sys.argv.extend(["--args.max-tasks", "20"])
 
     runpy.run_path(str(pathlib.Path(__file__).with_name("main.py")), run_name="__main__")
 

@@ -1,6 +1,10 @@
-# pi0.5 增加 3D 目标物条件工程 TODO
+# pi0.5 Object-Centric 工程 TODO
 
-## 当前路线
+> 当前主线（2026-07-22）：先验证并改进纯 2D object-centric。Point cloud 与 single-point 3D 暂停。
+> 下一阶段的结构、测试、训练和评测计划见
+> [`pi05_object_condition_step1_plan.md`](pi05_object_condition_step1_plan.md)。
+
+## 历史路线：Single-point 3D
 
 在原 2D object-centric 路线基础上，加入由 depth 提取的目标物 3D 点：
 
@@ -25,6 +29,9 @@ RGB 图像 + 语言指令 + 本体状态
 这里的 `target_point` 是 mask 内深度中位数配合 bbox 中心反投影得到的相机系代表点，只表达目标的大致中心位置；
 它不保留目标表面形状、点级局部几何、朝向和遮挡结构。因此代码中的 `object_condition="3d"` 是历史 CLI 名称，
 准确含义应理解为 `2D + single-point 3D condition`。
+
+该路线当前只保留为历史对照。正式主模型 `pi05_libero_object_2d_cross_attention` 严格使用
+`target_mask + target_bbox + target_crop`，不 repack 或发送 `target_point`。
 
 ## 已完成
 
@@ -169,7 +176,7 @@ Object adapter only 结果：
   抓取后失败 `18/88`，误抓 `1/100`；tomato sauce 仅 success `1/10`、抓取 `1/10`。
 - 与官方已有的相同前 30 条 rollout 配对：官方 success `29/30`，adapter success `19/30`；adapter 改善 0 条、
   退化 10 条、相同 20 条。冻结 legacy 参数仍不足以保持性能，无约束 object residual 本身会显著扰动成熟策略。
-- [ ] 下一轮给 object residual 增加幅度约束（固定小 scale 或有界 gate），并考虑加入保持官方动作输出的蒸馏损失。
+- [x] object residual 已增加固定 `0.1` scale；有界 learnable gate 纳入 Step 1，动作蒸馏保留为后续方案。
 
 ## 单点 3D 升级收尾
 
@@ -230,7 +237,9 @@ Point cloud 与单点 3D 升级暂时冻结。当前主问题不是“更多 3D 
 - [x] 冻结全部 legacy policy 参数，只训练 `object_condition_*` encoder/cross-attention。
 - [x] 2D 训练输入严格限制为 `target_mask + target_bbox + target_crop`，不 repack `target_point`。
 - [x] 在线评测增加 `--args.object-condition 2d`，不向 server 发送 `target_point`。
-- [ ] Base 与 2D 使用完全相同的 task IDs、rollout seed、replan steps 和 episode horizon。
+- [x] RGB、target mask、masked crop 和 bbox 使用同一组 RandomCrop/Rotate 参数；增强后从 mask 重算 bbox。
+- [x] mask 使用 nearest interpolation，RGB/crop 使用 linear interpolation；空 bbox 在 resize/augmentation 后保持全零。
+- [x] Base 与 2D 使用完全相同的 task IDs、rollout seed、replan steps 和 episode horizon。
 
 旧的 `pi05_libero_object_mask_only/crop_only/bbox_only` 从 `pi05_base` 初始化并解冻 action expert，不能直接与
 官方 `pi05_libero` 组成公平主实验；它们只保留为早期探索配置，不用于核心结论。
@@ -245,14 +254,34 @@ Point cloud 与单点 3D 升级暂时冻结。当前主问题不是“更多 3D 
 
 ### 最小证据链
 
-- [ ] 训练 `pi05_libero_object_2d_cross_attention`，先保存 `250/500/750/999` 四个 checkpoint。
-- [ ] 用原始 LIBERO Object 小样本筛选 checkpoint，淘汰明显破坏 Base 行为的版本。
-- [ ] 主评测 A：LIBERO-P `_level*` 目标位移，覆盖多目标和 Level 1-5。
+- [x] 训练 `pi05_libero_object_2d_cross_attention`：batch 8、5k steps，保存 1k-4999 checkpoints。
+- [x] 使用独立 `_sample2` 开发集筛选 checkpoint，最终选择 4999，未查看正式 `_sample1` 结果。
+- [x] 主评测 A：LIBERO-P `_level*` 目标位移，覆盖 10 类目标物和 Level 1-5。
 - [ ] 主评测 B：LIBERO-P `add_*` 干扰物增加，覆盖多目标而非连续单任务。
 - [ ] 保真评测：原始 LIBERO Object，确认 2D 模型相对官方 Base 的性能保持。
-- [ ] 至少使用 seed `7/42/123`，每组累计不少于 60 个严格配对回合。
-- [ ] 报告 success、target grasp、post-grasp failure、wrong-object grasp 和成功步数。
-- [ ] 使用配对 task-level bootstrap CI 或 exact McNemar，而不是只比较点估计。
+- [x] 使用 seed `7/42/123`，三组各 150 个严格配对回合，共 450 episodes。
+- [x] 报告 success、target grasp、post-grasp failure、wrong-object grasp 和成功步数。
+- [x] 报告配对 wins/losses/ties 和 exact McNemar，而不是只比较点估计。
+
+### 2D 正式评测结果（2026-07-22）
+
+LIBERO-P `_sample1` 目标位置扰动，50 tasks x seeds `7/42/123`：
+
+| 模型 | Success | Target grasp | Grasp failure | Post-grasp failure | Wrong-object |
+|---|---:|---:|---:|---:|---:|
+| Official `pi05_libero` | 82.7% | 87.3% | 12.7% | 4.7% | 7.3% |
+| Frozen-none | 82.7% | 87.3% | 12.7% | 4.7% | 6.7% |
+| Object-2D 4999 | 80.0% | 89.3% | 10.7% | 9.3% | 8.7% |
+
+- Frozen-none 与 Official success 都是 `124/150`，配对 `5 wins / 5 losses`，说明加载、标准化和冻结对照公平。
+- Object-2D 相对 Official：`9 wins / 13 losses / 128 ties`，exact McNemar `p=0.5235`，无显著提升。
+- Object-2D 抓取率提高 2 个百分点，但 post-grasp failure 从 4.7% 升至 9.3%，最终 success 下降 2.7 个百分点。
+- 双方都成功的 111 项中，Object-2D 平均少用 9.3 步，82 项更快、26 项更慢、3 项相同。
+- 按位置 level 的 success：Official 为 `96.7/93.3/76.7/86.7/60.0%`，Object-2D 为
+  `96.7/90.0/83.3/73.3/56.7%`；没有形成随位移增大而稳定扩大的优势，Level 4 回退明显。
+- 当前结论不是 object-centric 无效，而是“固定 scale、只训练 adapter 的单次 cross-attention 注入”改善部分抓取与
+  效率，却会干扰 post-grasp 控制。Step 1 改为 object self-attention encoder + bounded learnable gate。
+- [x] 增加三组失败并集重跑脚本和逐帧半透明 mask/bbox overlay；即使 `object-condition=none` 也只可视化而不向模型传条件。
 
 ### 必要消融
 

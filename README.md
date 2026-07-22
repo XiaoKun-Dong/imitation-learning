@@ -38,6 +38,7 @@ action expert tokens -- cross-attention --> conditioned action tokens
 - cross-attention output projection 使用 zero initialization。
 - object residual scale 固定为 `0.1`。
 - 训练和推理均不向 2D 模型传入 depth 或 `target_point`。
+- 训练时 base RGB、target mask、masked crop 和 bbox 共享同一组 RandomCrop/Rotate 参数，避免空间错位。
 
 ## 环境要求
 

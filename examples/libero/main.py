@@ -14,7 +14,7 @@ from libero.libero.envs import SegmentationRenderEnv
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
-from PIL import Image
+from PIL import Image, ImageDraw
 from robosuite.utils import camera_utils
 import tqdm
 import tyro
@@ -53,6 +53,7 @@ class Args:
     # Utils
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
+    debug_object_overlay: bool = False  # Overlay the live target mask and bbox on rollout videos.
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -140,8 +141,21 @@ def eval_libero(args: Args) -> None:
                     wrist_img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
+                    target_condition = None
+                    needs_policy_condition = args.object_condition != "none" and not action_plan
+                    if args.debug_object_overlay or needs_policy_condition:
+                        target_condition = _get_target_object_condition(
+                            env,
+                            obs,
+                            img,
+                            args.resize_size,
+                            include_point=args.object_condition == "3d" and needs_policy_condition,
+                        )
+
+                    replay_image = img
+                    if args.debug_object_overlay and target_condition is not None:
+                        replay_image = _draw_object_overlay(img, target_condition[0], target_condition[1])
+                    replay_images.append(replay_image)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -159,13 +173,8 @@ def eval_libero(args: Args) -> None:
                             "prompt": str(task_description),
                         }
                         if args.object_condition != "none":
-                            target_mask, target_bbox, target_crop, target_point = _get_target_object_condition(
-                                env,
-                                obs,
-                                img,
-                                args.resize_size,
-                                include_point=args.object_condition == "3d",
-                            )
+                            assert target_condition is not None
+                            target_mask, target_bbox, target_crop, target_point = target_condition
                             element.update(
                                 {
                                     "target_mask": target_mask,
@@ -410,6 +419,28 @@ def _crop_from_bbox(image, bbox):
         return padded
     padded[y1:y2, x1:x2] = image[y1:y2, x1:x2]
     return padded
+
+
+def _draw_object_overlay(image: np.ndarray, mask: np.ndarray, bbox: np.ndarray) -> np.ndarray:
+    """Overlay a translucent target mask and its bbox without modifying the policy input image."""
+    overlay = np.asarray(image).copy()
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != overlay.shape[:2]:
+        raise ValueError(f"Mask shape {mask.shape} does not match image shape {overlay.shape[:2]}")
+
+    if np.any(mask):
+        color = np.asarray([255, 64, 64], dtype=np.float32)
+        overlay[mask] = np.rint(overlay[mask].astype(np.float32) * 0.55 + color * 0.45).astype(np.uint8)
+
+    x1, y1, x2, y2 = np.asarray(bbox).astype(np.int32)
+    if x2 > x1 and y2 > y1:
+        height, width = overlay.shape[:2]
+        x1, y1 = np.clip([x1, y1], [0, 0], [width - 1, height - 1])
+        x2, y2 = np.clip([x2 - 1, y2 - 1], [0, 0], [width - 1, height - 1])
+        output = Image.fromarray(overlay)
+        ImageDraw.Draw(output).rectangle((int(x1), int(y1), int(x2), int(y2)), outline=(64, 255, 128), width=2)
+        overlay = np.asarray(output)
+    return overlay
 
 
 def _target_point_from_depth(env, mask, bbox, depth):

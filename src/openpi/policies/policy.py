@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from openpi_client import base_policy as _base_policy
-import torch
 from typing_extensions import override
 
 from openpi import transforms as _transforms
@@ -56,6 +55,8 @@ class Policy(BasePolicy):
         self._pytorch_device = pytorch_device
 
         if self._is_pytorch_model:
+            import torch
+
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
@@ -75,13 +76,20 @@ class Policy(BasePolicy):
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
+            import torch
+
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
-            noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+            if self._is_pytorch_model:
+                import torch
+
+                noise = torch.from_numpy(noise).to(self._pytorch_device)
+            else:
+                noise = jnp.asarray(noise)
 
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)

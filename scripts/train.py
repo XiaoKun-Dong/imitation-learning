@@ -198,6 +198,12 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if getattr(model, "object_condition_use_gate", False):
+        raw_gate = model.object_condition_gate.value
+        gate = jax.nn.sigmoid(raw_gate)
+        info["object_condition_gate_raw"] = raw_gate
+        info["object_condition_gate"] = gate
+        info["object_condition_effective_scale"] = gate
     return new_state, info
 
 
@@ -270,7 +276,7 @@ def main(config: _config.TrainConfig):
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
-        if step % config.log_interval == 0:
+        if step % config.log_interval == 0 or step == config.num_train_steps - 1:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())

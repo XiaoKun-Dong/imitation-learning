@@ -75,6 +75,7 @@ def _resize_target_bbox(
 ) -> at.Array:
     """Resize an absolute pixel bbox [x1, y1, x2, y2) through resize-with-pad geometry."""
     bbox = jnp.asarray(bbox, dtype=jnp.float32)
+    has_bbox = jnp.any(jnp.abs(bbox) > 0, axis=-1)
     cur_height, cur_width = original_hw
     target_height, target_width = image_resolution
     ratio = max(cur_width / target_width, cur_height / target_height)
@@ -85,7 +86,99 @@ def _resize_target_bbox(
 
     scale = jnp.asarray([resized_width / cur_width, resized_height / cur_height] * 2, dtype=jnp.float32)
     offset = jnp.asarray([pad_w0, pad_h0, pad_w0, pad_h0], dtype=jnp.float32)
-    return bbox * scale + offset
+    resized_bbox = bbox * scale + offset
+    return jnp.where(has_bbox[..., None], resized_bbox, 0.0)
+
+
+def _bbox_from_target_mask(mask: at.Bool[at.Array, "b h w"]) -> at.Float[at.Array, "b 4"]:
+    """Return absolute [x1, y1, x2, y2) boxes for a batch of masks."""
+    mask = jnp.asarray(mask, dtype=jnp.bool_)
+    rows = jnp.any(mask, axis=2)
+    cols = jnp.any(mask, axis=1)
+    has_mask = jnp.any(mask, axis=(1, 2))
+    y1 = jnp.argmax(rows, axis=1)
+    x1 = jnp.argmax(cols, axis=1)
+    y2 = mask.shape[1] - jnp.argmax(rows[:, ::-1], axis=1)
+    x2 = mask.shape[2] - jnp.argmax(cols[:, ::-1], axis=1)
+    bbox = jnp.stack([x1, y1, x2, y2], axis=1).astype(jnp.float32)
+    return jnp.where(has_mask[:, None], bbox, 0.0)
+
+
+def _bbox_to_corners(bbox: at.Float[at.Array, "b 4"]) -> at.Float[at.Array, "b 4 2"]:
+    """Convert xyxy-exclusive boxes to Augmax (y, x) keypoints."""
+    bbox = jnp.asarray(bbox, dtype=jnp.float32)
+    x1, y1, x2, y2 = jnp.moveaxis(bbox, -1, 0)
+    x2 = jnp.maximum(x1, x2 - 1.0)
+    y2 = jnp.maximum(y1, y2 - 1.0)
+    return jnp.stack(
+        [
+            jnp.stack([y1, x1], axis=-1),
+            jnp.stack([y1, x2], axis=-1),
+            jnp.stack([y2, x1], axis=-1),
+            jnp.stack([y2, x2], axis=-1),
+        ],
+        axis=1,
+    )
+
+
+def _bbox_from_corners(
+    corners: at.Float[at.Array, "b 4 2"], has_bbox: at.Bool[at.Array, " b"], image_resolution: tuple[int, int]
+) -> at.Float[at.Array, "b 4"]:
+    """Convert transformed (y, x) corners back to clipped xyxy-exclusive boxes."""
+    height, width = image_resolution
+    ys = corners[..., 0]
+    xs = corners[..., 1]
+    x1 = jnp.clip(jnp.floor(jnp.min(xs, axis=1)), 0, width)
+    y1 = jnp.clip(jnp.floor(jnp.min(ys, axis=1)), 0, height)
+    x2 = jnp.clip(jnp.ceil(jnp.max(xs, axis=1)) + 1.0, 0, width)
+    y2 = jnp.clip(jnp.ceil(jnp.max(ys, axis=1)) + 1.0, 0, height)
+    bbox = jnp.stack([x1, y1, x2, y2], axis=1).astype(jnp.float32)
+    return jnp.where(has_bbox[:, None], bbox, 0.0)
+
+
+def _augment_base_image_and_object_condition(
+    rng: at.KeyArrayLike,
+    image: at.Float[at.Array, "b h w 3"],
+    target_mask: at.Bool[at.Array, "b h w"] | None,
+    target_crop: at.Float[at.Array, "b h w 3"] | None,
+    target_bbox: at.Float[at.Array, "b 4"] | None,
+) -> tuple[at.Float[at.Array, "b h w 3"], at.Array | None, at.Array | None, at.Array | None]:
+    """Apply one sampled geometric transform to base RGB and all spatial object inputs."""
+    height, width = image.shape[1:3]
+    inputs = {"image": image / 2.0 + 0.5}
+    input_types = {"image": augmax.InputType.IMAGE}
+    if target_mask is not None:
+        inputs["target_mask"] = target_mask[..., None].astype(jnp.float32)
+        input_types["target_mask"] = augmax.InputType.MASK
+    if target_crop is not None:
+        inputs["target_crop"] = target_crop
+        input_types["target_crop"] = augmax.InputType.IMAGE
+    has_bbox = None
+    if target_bbox is not None:
+        has_bbox = jnp.any(jnp.abs(target_bbox) > 0, axis=1)
+        inputs["bbox_corners"] = _bbox_to_corners(target_bbox)
+        input_types["bbox_corners"] = augmax.InputType.KEYPOINTS
+
+    transform = augmax.Chain(
+        augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+        augmax.Resize(width, height),
+        augmax.Rotate((-5, 5)),
+        augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+        input_types=input_types,
+    )
+    sub_rngs = jax.random.split(rng, image.shape[0])
+    augmented = jax.vmap(transform)(sub_rngs, inputs)
+
+    image = augmented["image"] * 2.0 - 1.0
+    if target_mask is not None:
+        target_mask = augmented["target_mask"][..., 0] > 0.5
+    if target_crop is not None:
+        target_crop = augmented["target_crop"]
+    if target_mask is not None:
+        target_bbox = _bbox_from_target_mask(target_mask)
+    elif target_bbox is not None:
+        target_bbox = _bbox_from_corners(augmented["bbox_corners"], has_bbox, (height, width))
+    return image, target_mask, target_crop, target_bbox
 
 
 # Data format
@@ -226,6 +319,18 @@ def preprocess_observation(
     batch_shape = observation.state.shape[:-1]
 
     first_image_shape = observation.images[image_keys[0]].shape[1:3]
+    target_mask = observation.target_mask
+    if target_mask is not None and target_mask.shape[-2:] != image_resolution:
+        target_mask = _resize_target_mask(target_mask, image_resolution)
+
+    target_crop = observation.target_crop
+    if target_crop is not None and target_crop.shape[1:3] != image_resolution:
+        target_crop = _resize_target_crop(target_crop, image_resolution)
+
+    target_bbox = observation.target_bbox
+    if target_bbox is not None and first_image_shape != image_resolution:
+        target_bbox = _resize_target_bbox(target_bbox, first_image_shape, image_resolution)
+
     out_images = {}
     for key in image_keys:
         image = observation.images[key]
@@ -234,6 +339,13 @@ def preprocess_observation(
             image = image_tools.resize_with_pad(image, *image_resolution)
 
         if train:
+            if key == image_keys[0] and any(value is not None for value in (target_mask, target_crop, target_bbox)):
+                image, target_mask, target_crop, target_bbox = _augment_base_image_and_object_condition(
+                    rng, image, target_mask, target_crop, target_bbox
+                )
+                out_images[key] = image
+                continue
+
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
 
@@ -255,20 +367,6 @@ def preprocess_observation(
             image = image * 2.0 - 1.0
 
         out_images[key] = image
-
-    target_mask = observation.target_mask
-    if target_mask is not None and target_mask.shape[-2:] != image_resolution:
-        target_mask = _resize_target_mask(target_mask, image_resolution)
-
-    target_crop = observation.target_crop
-    if target_crop is not None and target_crop.shape[1:3] != image_resolution:
-        target_crop = _resize_target_crop(target_crop, image_resolution)
-
-    target_bbox = observation.target_bbox
-    if target_bbox is not None and first_image_shape != image_resolution:
-        # Bboxes are absolute pixel coordinates [x1, y1, x2, y2) in the source image frame.
-        # They must not be normalized to [0, 1].
-        target_bbox = _resize_target_bbox(target_bbox, first_image_shape, image_resolution)
 
     # obtain mask
     out_masks = {}
@@ -330,6 +428,12 @@ class BaseModelConfig(abc.ABC):
         missing_paths = set(flat_expected) - set(flat_params)
         legacy_object_paths = {path for path in missing_paths if path and path[0].startswith("object_condition_")}
         if legacy_object_paths == missing_paths:
+            loaded_has_object_params = any(path and path[0].startswith("object_condition_") for path in flat_params)
+            if loaded_has_object_params and legacy_object_paths:
+                raise ValueError(
+                    "Object-condition checkpoint is missing parameters required by this model config. "
+                    "Use the checkpoint's original config or an explicit migration."
+                )
             for path in legacy_object_paths:
                 flat_params[path] = flat_expected[path]
             params = traverse_util.unflatten_dict(flat_params)

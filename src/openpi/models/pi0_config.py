@@ -36,6 +36,12 @@ class Pi0Config(_model.BaseModelConfig):
     object_condition_dropout_rate: float = 0.0
     object_condition_num_heads: int = 8
     object_condition_residual_scale: float = 0.1
+    # Keep the legacy object branch as the default so existing object checkpoints retain
+    # their exact architecture. Step-1 configs explicitly enable the encoder and gate.
+    object_condition_encoder_layers: int = 0
+    object_condition_encoder_mlp_ratio: int = 4
+    object_condition_use_gate: bool = False
+    object_condition_gate_init: float = -4.0
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -50,6 +56,10 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("object_condition_num_heads must be positive")
         if not 0.0 < self.object_condition_residual_scale <= 1.0:
             raise ValueError("object_condition_residual_scale must be in (0, 1]")
+        if self.object_condition_encoder_layers < 0:
+            raise ValueError("object_condition_encoder_layers must be non-negative")
+        if self.object_condition_encoder_mlp_ratio <= 0:
+            raise ValueError("object_condition_encoder_mlp_ratio must be positive")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
