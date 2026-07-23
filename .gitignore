@@ -2,6 +2,7 @@
 assets/
 checkpoints/
 data/
+outputs/
 wandb/
 
 # Byte-compiled / optimized / DLL files
@@ -162,6 +163,7 @@ cython_debug/
 
 # External LIBERO-plus checkout and downloaded assets.
 /third_party/libero-plus/
+/ultralytics/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

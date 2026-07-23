@@ -940,8 +940,8 @@ _CONFIGS = [
             extra_delta_transform=False,
             object_condition_keys=("target_mask", "target_bbox", "target_crop"),
         ),
-        batch_size=8,
-        num_workers=4,
+        batch_size=16,
+        num_workers=0,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=500,
             peak_lr=1e-5,
