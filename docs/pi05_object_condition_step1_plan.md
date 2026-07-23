@@ -160,7 +160,7 @@ return action_tokens + effective_delta
 - [x] 在 patch token 与 geometry token concat 后调用 encoder。
 - [x] 复用并验证 `has_condition`，确保空条件严格 no-op。
 - [x] 在 object cross-attention residual 上加入 bounded learnable gate。
-- [ ] 将 gate、effective scale 和 residual RMS 接入训练 metrics（gate 与 effective scale 已完成，RMS 待补）。
+- [x] 将 gate、effective scale、object delta/residual RMS 和 action token RMS 接入训练 metrics。
 - [x] 检查参数路径全部以 `object_condition_` 开头。
 - [x] 增加独立 `pi05_libero_object_2d_step1` 配置，未覆盖当前配置。
 
@@ -196,14 +196,19 @@ pi05_libero_object_2d_step1
 - [x] gate 初始化满足 `sigmoid(gate) ~= 0.018`。
 - [x] 默认 effective scale 约为 `0.0018`。
 - [x] gate 始终有界，最大注入幅度不超过 residual scale。
-- [ ] gate 与 output projection 在一次训练 step 后具有有限梯度。
+- [x] gate 与 output projection 在非零 residual 分支下具有有限且非零梯度。
 
 ### Freeze 与 checkpoint
 
 - [x] trainable filter 只选择 `object_condition_*`。
 - [x] 所有 encoder/gate 参数均被选中，无漏训参数。
 - [x] 官方 checkpoint 可加载并初始化新增参数。
-- [ ] 保存、恢复 Step 1 checkpoint 后输出一致。
+- [x] 保存、恢复 Step 1 object 参数后输出一致。
+
+P0 gate 审计（2026-07-23）：原实现启用 gate 时错误地以 `sigmoid(gate)` 覆盖固定 residual scale，使初始
+effective scale 为 `0.01799`，而不是计划中的 `0.001799`。现已修复为
+`residual_scale * sigmoid(gate)`。修复前训练的 `step1_gate_5k` checkpoint 对应旧公式，不能直接作为修复后
+模型的正式结果；后续 Step 1 需从官方 checkpoint 重新训练。
 
 建议测试命令：
 
@@ -216,9 +221,12 @@ uv run pytest -q src/openpi/models/model_test.py \
 
 ### Smoke
 
-- [ ] batch 1、2 steps，验证 batch/JIT/loss/checkpoint。
-- [ ] 检查 gate、residual RMS、grad norm 非 NaN。
+- [x] batch 1、2 steps，验证 batch/JIT/loss/checkpoint。
+- [x] 检查 gate、residual RMS、grad norm 非 NaN。
 - [ ] 检查官方参数在 step 前后逐项不变。
+
+P0 smoke 输出位于 `checkpoints/pi05_libero_object_2d_step1/p0_metrics_smoke/1`。两步的
+effective scale 均约 `0.0018`，grad norm 分别约 `0.0018/0.0019`，所有新增指标均为有限值。
 
 ### 主训练
 

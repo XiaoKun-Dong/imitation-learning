@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.rovla_config as rovla_config
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -50,6 +51,16 @@ def _freeze_vla_backbone_filter() -> Filter:
 def _freeze_all_except_object_condition_filter() -> Filter:
     """Freeze every legacy parameter and train only object cross-attention."""
     return nnx.Not(nnx_utils.PathRegex("object_condition_.*"))
+
+
+def _freeze_all_except_object_dynamic_gate_filter() -> Filter:
+    """Freeze the policy and learned object adapter; train only the P2 dynamic gate."""
+    return nnx.Not(nnx_utils.PathRegex("object_condition_dynamic_gate_.*"))
+
+
+def _freeze_all_except_rovla_filter() -> Filter:
+    """Freeze pi0.5 and train only the RoVLA adapter."""
+    return nnx.Not(nnx_utils.PathRegex("rovla_.*"))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -338,7 +349,14 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                 "target_crop",
                 "target_point",
             )
-            invalid_keys = set(object_condition_keys) - {"target_mask", "target_bbox", "target_crop", "target_point"}
+            invalid_keys = set(object_condition_keys) - {
+                "target_mask",
+                "target_bbox",
+                "target_crop",
+                "target_point",
+                "object_condition_confidence",
+                "object_semantic_tokens",
+            }
             if invalid_keys:
                 raise ValueError(f"Invalid object condition keys: {sorted(invalid_keys)}")
             repack_structure.update({key: key for key in object_condition_keys})
@@ -589,43 +607,6 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
-def _make_pi05_libero_object_mask_ablation_config(
-    *,
-    name: str,
-    object_condition_keys: Sequence[str],
-    object_condition_dropout_rate: float = 0.1,
-) -> TrainConfig:
-    return TrainConfig(
-        name=name,
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=False,
-            object_condition_dropout_rate=object_condition_dropout_rate,
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            object_condition_keys=tuple(object_condition_keys),
-        ),
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        freeze_filter=_freeze_vla_backbone_filter(),
-        num_train_steps=30_000,
-    )
-
-
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -832,64 +813,6 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
-        name="pi05_libero_object_mask",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            include_object_condition=True,
-        ),
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        freeze_filter=_freeze_vla_backbone_filter(),
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi05_libero_object_cross_attention",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            assets=AssetsConfig(
-                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
-                asset_id="physical-intelligence/libero",
-            ),
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            include_object_condition=True,
-        ),
-        batch_size=1,
-        num_workers=4,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=100,
-            peak_lr=1e-5,
-            decay_steps=1_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_libero/params"),
-        freeze_filter=_freeze_all_except_object_condition_filter(),
-        num_train_steps=1_000,
-        save_interval=250,
-        keep_period=250,
-    ),
-    TrainConfig(
         name="pi05_libero_object_2d_cross_attention",
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
@@ -922,7 +845,7 @@ _CONFIGS = [
         keep_period=250,
     ),
     TrainConfig(
-        name="pi05_libero_object_2d_step1",
+        name="pi05_libero_object_2d_step1_gate0",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=10,
@@ -931,7 +854,7 @@ _CONFIGS = [
             object_condition_encoder_layers=2,
             object_condition_encoder_mlp_ratio=4,
             object_condition_use_gate=True,
-            object_condition_gate_init=-4.0,
+            object_condition_gate_init=0.0,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="local/libero_object_mask",
@@ -960,30 +883,81 @@ _CONFIGS = [
         save_interval=1_000,
         keep_period=1_000,
     ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_none",
-        object_condition_keys=(),
-        object_condition_dropout_rate=0.0,
+    TrainConfig(
+        name="pi05_libero_object_2d_dynamic_gate",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            object_condition_dropout_rate=0.1,
+            object_condition_encoder_layers=2,
+            object_condition_encoder_mlp_ratio=4,
+            object_condition_use_gate=True,
+            object_condition_gate_init=0.0,
+            object_condition_dynamic_gate=True,
+            object_condition_dynamic_gate_bias_init=-3.4760987,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="local/libero_object_mask",
+            root="data/lerobot/local/libero_object_mask",
+            assets=AssetsConfig(
+                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            object_condition_keys=("target_mask", "target_bbox", "target_crop"),
+        ),
+        batch_size=8,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=1e-4,
+            decay_steps=500,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/dongxiaokun/imitation-learning/openpi/checkpoints/pi05_libero_object_2d_step1_gate0/gate0_pilot_100/99/params"
+        ),
+        freeze_filter=_freeze_all_except_object_dynamic_gate_filter(),
+        num_train_steps=500,
+        save_interval=100,
+        keep_period=100,
     ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_bbox_only",
-        object_condition_keys=("target_bbox",),
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_mask_only",
-        object_condition_keys=("target_mask",),
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_crop_only",
-        object_condition_keys=("target_crop",),
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_point_only",
-        object_condition_keys=("target_point",),
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_mask_point",
-        object_condition_keys=("target_mask", "target_point"),
+    TrainConfig(
+        name="rovla_libero",
+        model=rovla_config.RoVLAConfig(action_horizon=10),
+        data=LeRobotLiberoDataConfig(
+            repo_id="local/libero_object_mask",
+            root="data/lerobot/local/libero_object_mask",
+            assets=AssetsConfig(
+                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            object_condition_keys=("target_mask", "target_bbox", "target_crop"),
+        ),
+        batch_size=8,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-5,
+            decay_steps=10_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/dongxiaokun/baseck/pi05_libero/params",
+            missing_regex=".*(lora|rovla).*",
+        ),
+        freeze_filter=_freeze_all_except_rovla_filter(),
+        num_train_steps=10_000,
+        save_interval=1_000,
+        keep_period=1_000,
     ),
     #
     # Fine-tuning Aloha configs.

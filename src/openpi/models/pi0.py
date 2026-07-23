@@ -74,8 +74,11 @@ class Pi0(_model.BaseModel):
         self.object_condition_dropout_rate = config.object_condition_dropout_rate
         self.object_condition_num_heads = config.object_condition_num_heads
         self.object_condition_residual_scale = config.object_condition_residual_scale
+        self.object_condition_inference_scale = config.object_condition_inference_scale
         self.object_condition_encoder_layers = config.object_condition_encoder_layers
         self.object_condition_use_gate = config.object_condition_use_gate
+        self.object_condition_dynamic_gate = config.object_condition_dynamic_gate
+        self.object_condition_dynamic_gate_bias = config.object_condition_dynamic_gate_bias_init
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -147,6 +150,21 @@ class Pi0(_model.BaseModel):
         )
         if self.object_condition_use_gate:
             self.object_condition_gate = nnx.Param(jnp.asarray(config.object_condition_gate_init, dtype=jnp.float32))
+        if self.object_condition_dynamic_gate:
+            self.object_condition_dynamic_gate_action_norm = nnx.LayerNorm(action_expert_config.width, rngs=rngs)
+            self.object_condition_dynamic_gate_state_proj = nnx.Linear(
+                config.action_dim, action_expert_config.width, rngs=rngs
+            )
+            self.object_condition_dynamic_gate_time_proj = nnx.Linear(
+                action_expert_config.width, action_expert_config.width, rngs=rngs
+            )
+            self.object_condition_dynamic_gate_output_proj = nnx.Linear(
+                action_expert_config.width,
+                1,
+                kernel_init=nnx.initializers.zeros,
+                bias_init=nnx.initializers.zeros,
+                rngs=rngs,
+            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -284,7 +302,11 @@ class Pi0(_model.BaseModel):
             at.Bool[at.Array, "b object_s"],
             at.Bool[at.Array, " b"],
         ],
-    ) -> at.Float[at.Array, "b action_s emb"]:
+        *,
+        state: at.Float[at.Array, "b state"] | None = None,
+        time_features: at.Float[at.Array, "b emb"] | None = None,
+        return_metrics: bool = False,
+    ):
         """Let each action token independently retrieve target-object information."""
         object_tokens, object_token_mask, has_condition = object_condition
         query = self.object_condition_query_proj(action_tokens)
@@ -303,10 +325,48 @@ class Pi0(_model.BaseModel):
         attended = einops.rearrange(attended, "b h s d -> b s (h d)")
         delta = self.object_condition_output_proj(attended)
         delta = delta * has_condition[:, None, None].astype(delta.dtype)
-        residual_scale = self.object_condition_residual_scale
-        if self.object_condition_use_gate:
-            residual_scale = jax.nn.sigmoid(self.object_condition_gate.value)
-        return action_tokens + jnp.asarray(residual_scale, dtype=delta.dtype) * delta
+        gate = None
+        if self.object_condition_inference_scale is not None:
+            effective_scale = jnp.asarray(self.object_condition_inference_scale, dtype=delta.dtype)
+        elif self.object_condition_dynamic_gate:
+            if state is None or time_features is None:
+                raise ValueError("Dynamic object gate requires state and time_features")
+            gate_features = self.object_condition_dynamic_gate_action_norm(action_tokens)
+            gate_features = gate_features + nnx.swish(self.object_condition_dynamic_gate_state_proj(state))[:, None, :]
+            gate_features = (
+                gate_features + nnx.swish(self.object_condition_dynamic_gate_time_proj(time_features))[:, None, :]
+            )
+            dynamic_logits = self.object_condition_dynamic_gate_output_proj(nnx.swish(gate_features))
+            gate = jax.nn.sigmoid(dynamic_logits.astype(jnp.float32) + self.object_condition_dynamic_gate_bias)
+            effective_scale = jnp.asarray(self.object_condition_residual_scale, dtype=delta.dtype) * gate.astype(
+                delta.dtype
+            )
+        else:
+            effective_scale = jnp.asarray(self.object_condition_residual_scale, dtype=delta.dtype)
+            if self.object_condition_use_gate:
+                gate = jax.nn.sigmoid(self.object_condition_gate.value)
+                effective_scale = effective_scale * gate
+        residual = effective_scale * delta
+        conditioned_tokens = action_tokens + residual
+        if not return_metrics:
+            return conditioned_tokens
+        metrics = {
+            "object_condition_action_token_rms": jnp.sqrt(jnp.mean(jnp.square(action_tokens.astype(jnp.float32)))),
+            "object_condition_delta_rms": jnp.sqrt(jnp.mean(jnp.square(delta.astype(jnp.float32)))),
+            "object_condition_residual_rms": jnp.sqrt(jnp.mean(jnp.square(residual.astype(jnp.float32)))),
+            "object_condition_effective_scale": jnp.mean(jnp.asarray(effective_scale, dtype=jnp.float32)),
+        }
+        if gate is not None:
+            gate = jnp.asarray(gate, dtype=jnp.float32)
+            metrics.update(
+                {
+                    "object_condition_gate": jnp.mean(gate),
+                    "object_condition_gate_min": jnp.min(gate),
+                    "object_condition_gate_max": jnp.max(gate),
+                    "object_condition_gate_std": jnp.std(gate),
+                }
+            )
+        return conditioned_tokens, metrics
 
     def _drop_object_condition(
         self, rng: at.KeyArrayLike, obs: _model.Observation, *, train: bool
@@ -380,6 +440,7 @@ class Pi0(_model.BaseModel):
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
         at.Float[at.Array, "b emb"] | None,
+        dict[str, at.Float[at.Array, ""]],
     ]:
         input_mask = []
         ar_mask = []
@@ -415,8 +476,21 @@ class Pi0(_model.BaseModel):
             adarms_cond = None
 
         # Each action token retrieves the spatial/3D target information it needs.
+        object_metrics = {
+            "object_condition_action_token_rms": jnp.sqrt(
+                jnp.mean(jnp.square(action_expert_tokens.astype(jnp.float32)))
+            ),
+            "object_condition_delta_rms": jnp.asarray(0.0, dtype=jnp.float32),
+            "object_condition_residual_rms": jnp.asarray(0.0, dtype=jnp.float32),
+        }
         if object_cond is not None:
-            action_expert_tokens = self._cross_attend_object_condition(action_expert_tokens, object_cond)
+            action_expert_tokens, object_metrics = self._cross_attend_object_condition(
+                action_expert_tokens,
+                object_cond,
+                state=obs.state,
+                time_features=time_emb,
+                return_metrics=True,
+            )
 
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
@@ -425,12 +499,11 @@ class Pi0(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask, adarms_cond
+        return tokens, input_mask, ar_mask, adarms_cond, object_metrics
 
-    @override
-    def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    def _compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Float[at.Array, ""]]]:
         preprocess_rng, object_dropout_rng, noise_rng, time_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
         observation = self._drop_object_condition(object_dropout_rng, observation, train=train)
@@ -442,9 +515,10 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, object_metrics = self.embed_suffix(
+            observation, x_t, time
+        )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -453,8 +527,19 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1), object_metrics
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        loss, _ = self._compute_loss(rng, observation, actions, train=train)
+        return loss
+
+    def compute_loss_with_metrics(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Float[at.Array, ""]]]:
+        return self._compute_loss(rng, observation, actions, train=train)
 
     @override
     def sample_actions(
@@ -481,7 +566,7 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, _ = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each

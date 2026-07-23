@@ -36,12 +36,19 @@ class Pi0Config(_model.BaseModelConfig):
     object_condition_dropout_rate: float = 0.0
     object_condition_num_heads: int = 8
     object_condition_residual_scale: float = 0.1
+    # Evaluation-only override for the final applied object residual scale. This does
+    # not add parameters, so one checkpoint can be evaluated at multiple strengths.
+    object_condition_inference_scale: float | None = None
     # Keep the legacy object branch as the default so existing object checkpoints retain
     # their exact architecture. Step-1 configs explicitly enable the encoder and gate.
     object_condition_encoder_layers: int = 0
     object_condition_encoder_mlp_ratio: int = 4
     object_condition_use_gate: bool = False
     object_condition_gate_init: float = -4.0
+    # Per-action-token gate conditioned on action features, proprioception, and flow time.
+    # The bias is a fixed initialization point; only the dynamic gate modules are trained in P2.
+    object_condition_dynamic_gate: bool = False
+    object_condition_dynamic_gate_bias_init: float = -3.4760987  # sigmoid ~= 0.03; applied scale ~= 0.003.
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -56,10 +63,17 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("object_condition_num_heads must be positive")
         if not 0.0 < self.object_condition_residual_scale <= 1.0:
             raise ValueError("object_condition_residual_scale must be in (0, 1]")
+        if (
+            self.object_condition_inference_scale is not None
+            and not 0.0 <= self.object_condition_inference_scale <= 1.0
+        ):
+            raise ValueError("object_condition_inference_scale must be in [0, 1]")
         if self.object_condition_encoder_layers < 0:
             raise ValueError("object_condition_encoder_layers must be non-negative")
         if self.object_condition_encoder_mlp_ratio <= 0:
             raise ValueError("object_condition_encoder_mlp_ratio must be positive")
+        if self.object_condition_dynamic_gate and not self.object_condition_use_gate:
+            raise ValueError("object_condition_dynamic_gate requires object_condition_use_gate")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",

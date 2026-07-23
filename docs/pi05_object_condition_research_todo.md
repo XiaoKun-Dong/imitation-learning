@@ -113,27 +113,154 @@ object condition -> coarse action / phase representation -> final action expert
 
 ### P0：校正当前基线
 
-- [ ] 审计 gate 实现，确保有效注入为 `residual_scale * sigmoid(gate) * delta`，并验证初始值约为 `0.0018`。
-- [ ] 记录 raw gate、sigmoid gate、effective scale、object residual RMS 和 action token RMS。
-- [ ] 验证 `has_condition=False` 和 object dropout 时 residual 严格为零。
-- [ ] 完成 gate 与 output projection 的梯度、checkpoint 保存和恢复测试。
-- [ ] 用相同 checkpoint、任务顺序和 seed 复现 Official 与 Object-2D 基线。
+- [x] 审计 gate 实现，确保有效注入为 `residual_scale * sigmoid(gate) * delta`，并验证初始值约为 `0.0018`。
+- [x] 记录 raw gate、sigmoid gate、effective scale、object delta RMS、object residual RMS 和 action token RMS。
+- [x] 验证 `has_condition=False` 和 object dropout 时 residual 严格为零。
+- [x] 完成 gate 与 output projection 的有限梯度、参数保存和恢复一致性测试。
+- [x] 用相同 checkpoint、任务顺序和 seed 复现 Official 与 Object-2D 基线。
+
+P0 审计记录（2026-07-23）：
+
+- 修复前代码在启用 gate 时用 `sigmoid(gate)` 覆盖了 `object_condition_residual_scale`，初始 effective scale
+  实际约为 `0.01799`，是计划值 `0.001799` 的 10 倍。
+- 修复后 effective scale 为 `object_condition_residual_scale * sigmoid(gate)`，且 `0.1` 重新成为硬上限。
+- 训练日志新增 object delta、实际 residual 和注入前 action token 的 RMS，便于区分“大特征、小门控”和
+  “分支未学习”。
+- `step1_gate_5k` 等修复前 gate checkpoint 是在旧公式下训练的。修复后直接加载会改变其有效注入强度，
+  不能与旧评测混作同一模型；正式 Step 1 需要从 Official checkpoint 重新训练。
+- Official 与无 gate 的 Object-2D 正式配对基线不受本次公式修复影响，继续使用本文“当前实验结论”中的
+  固定任务顺序和 seeds `7/42/123` 结果。
+- 已完成 `batch=1, 2 steps` 全链路 smoke，loss、grad norm、gate、effective scale 和三类 RMS 均为有限值，
+  并成功保存 checkpoint：
+  `checkpoints/pi05_libero_object_2d_step1/p0_metrics_smoke/1`。
 
 ### P1：先验证注入强度，而不是继续堆叠编码器
 
-- [ ] 评估固定 scale：`0`、`0.001`、`0.003`、`0.01`、`0.03`、`0.1`。
+- [x] 新增 `pi05_libero_object_2d_step1_gate0`：保留 zero-init output projection，将 gate init 设为 `0`，
+  初始 effective scale 为 `0.05`，且不覆盖旧 Step 1 配置。
+- [x] 增加 policy-server 推理 scale override，使同一个 checkpoint 可以在不改变权重的情况下扫描注入强度。
+- [x] 使用 Step 99 固定权重评估 scale：`0`、`0.001`、`0.003`、`0.01`、`0.03`、`0.05`。
 - [ ] 分别统计 pre-grasp、grasp 和 post-grasp 阶段的 residual RMS。
 - [ ] 绘制 target-grasp gain 与 post-grasp regression 的关系曲线。
 - [ ] 判断退化来自注入幅度、注入时机，还是 object representation 本身。
 
+P1 固定权重协议：
+
+- checkpoint 固定为 `checkpoints/gate0_pilot_100/99`；
+- object encoder、cross-attention、gate 和所有 legacy policy 参数保持完全相同；
+- 仅通过 `--policy.object-condition-scale` 覆盖最终 applied residual scale；
+- scale `0` 是同 checkpoint 的严格无注入对照，可隔离“训练得到的新增参数”和“实际 residual 注入”；
+- 每个 scale 使用完全相同的 task IDs、episode seed、replan steps 和 horizon；
+- 当前 scale `0.05` 的 seed 7 初测为 success `16/20`、target grasp `18/20`、post-grasp failure `2/20`、
+  wrong-object `2/20`，仅作为曲线上的一个点，不据此选择强度。
+
+P1 固定权重结果（seed 7，同一批 20 个 task）：
+
+| Applied scale | Success | Target grasp | Grasp failure | Post-grasp failure | Wrong-object | 成功平均步数 |
+|---:|---:|---:|---:|---:|---:|---:|
+| `0` | 16/20 | 17/20 | 3/20 | 1/20 | 2/20 | 156.3 |
+| `0.001` | 17/20 | 17/20 | 3/20 | 0/20 | 2/20 | 163.1 |
+| `0.003` | 15/20 | 17/20 | 3/20 | 2/20 | 2/20 | 155.7 |
+| `0.01` | 14/20 | 18/20 | 2/20 | 4/20 | 1/20 | 146.0 |
+| `0.03` | 16/20 | 18/20 | 2/20 | 2/20 | 2/20 | 149.1 |
+| `0.05` | 16/20 | 18/20 | 2/20 | 2/20 | 2/20 | 157.8 |
+
+相对 scale `0` 的 success 严格配对结果：
+
+```text
+0.001: 1 win  / 0 losses / 19 ties, exact McNemar p=1.0
+0.003: 0 wins / 1 loss   / 19 ties, exact McNemar p=1.0
+0.01:  0 wins / 2 losses / 18 ties, exact McNemar p=0.5
+0.03:  1 win  / 1 loss   / 18 ties, exact McNemar p=1.0
+0.05:  1 win  / 1 loss   / 18 ties, exact McNemar p=1.0
+```
+
+P1 初步结论：
+
+- 静态注入强度确实改变行为，但 success 对 scale 呈非单调响应，没有稳定最优点。
+- `0.001` 的 success 最高，但 target grasp 与 scale `0` 相同，不能证明对象对齐改善。
+- `0.01` 及以上总体上提高 target grasp，但收益被 post-grasp failure 抵消；`0.01` 的冲突最明显。
+- 两个主要 wrong-object episode 在大多数 scale 下持续存在，单纯调节强度没有解决对象消歧。
+- 只有 5/20 个任务随 scale 改变，且所有差异均不显著；当前结果用于诊断，不用于宣称性能提升。
+- 静态全程注入无法同时满足抓取前增强和抓取后能力保持，后续方法重点应转向阶段自适应，而不是继续搜索
+  单一全局 scale。
+
 ### P2：实现动态门控
 
-- [ ] Gate-V0：全局标量 gate，作为最小对照，不作为最终方法。
+- [x] Gate-V0：全局标量 gate，已通过 P1 固定权重 scale sweep 完成最小对照。
 - [ ] Gate-V1：`gate(action_token, flow_timestep)`。
-- [ ] Gate-V2：`gate(action_token, proprioception, flow_timestep)`。
+- [x] Gate-V2：实现 per-action-token `gate(action_token, proprioception, flow_timestep)`。
 - [ ] 比较 scalar、per-token 和 per-layer gate；首轮优先 per-token 单点注入。
-- [ ] 检查门控是否在抓取后自然下降，而不是仅将全局注入压到接近零。
-- [ ] 增加 gate 饱和、方差和阶段分布日志。
+- [x] 检查门控是否在抓取后自然下降：当前训练将 gate 整体推高，rollout 未显示抓取后保护，假设未通过。
+- [ ] 增加 gate 饱和、方差和阶段分布日志（mean/min/max/std 已完成，rollout 阶段分布待补）。
+
+P2 实现协议：
+
+```text
+固定：Official policy + Step 99 object encoder/cross-attention/output projection
+训练：object_condition_dynamic_gate_* only
+输入：action token + proprioception + flow timestep
+输出：per-action-token gate
+初始化：sigmoid(-3.4761) ~= 0.03
+初始 applied scale：0.1 * 0.03 ~= 0.003
+```
+
+- dynamic gate output projection 使用 zero init，初始化时所有 token 精确退化为 P1 的固定 scale `0.003`；
+- gate 在每个 denoising flow step 重新计算，可依赖当前 noisy action 和 flow timestep；
+- Step 99 object adapter 与全部 legacy policy 参数冻结，避免重新训练 encoder 导致变量混杂；
+- 训练配置为 `pi05_libero_object_2d_dynamic_gate`，从
+  `checkpoints/gate0_pilot_100/99/params` 加载；
+- 已完成 `batch=1, 2 steps` smoke：初始 effective scale `0.003`，第二步 gate std 变为非零，
+  loss、grad norm、gate 和 residual RMS 均为有限值；checkpoint 位于
+  `checkpoints/pi05_libero_object_2d_dynamic_gate/p2_dynamic_gate_smoke/1`。
+
+P2 训练后不能只根据 loss 或 gate mean 选 checkpoint，至少要求：
+
+- gate std 明显大于零，证明不是退化为另一个全局标量；
+- gate min/max 不快速饱和到 `0/1`；
+- gate 与 proprioception、flow timestep 或 action token 的变化存在可重复关系；
+- rollout 中 pre-grasp 的 applied residual 高于 post-grasp，且 post-grasp failure 相比固定 scale 回落；
+- conditioned rollout 相比 scale `0` 提高 target grasp 或降低 wrong-object，同时不损害最终 success。
+
+P2 训练与评测结果（seed 7，同一批 20 个 task）：
+
+训练到 Step 499 时，object adapter 的 `delta_rms` 稳定在约 `0.076`，证明冻结有效；但 gate mean 从 `0.03`
+上升至 `0.857`，min/max 为 `0.682/0.930`，effective scale 上升至 `0.0857`。gate std 为 `0.056`，
+说明它不是严格的全局标量，但所有 token 的 gate 都处于较高区间，整体行为接近“全程打开”。
+
+| 模型 | Success | Target grasp | Grasp failure | Post-grasp failure | Wrong-object | 成功平均步数 |
+|---|---:|---:|---:|---:|---:|---:|
+| Fixed scale `0` | 16/20 | 17/20 | 3/20 | 1/20 | 2/20 | 156.3 |
+| Fixed scale `0.001` | 17/20 | 17/20 | 3/20 | 0/20 | 2/20 | 163.1 |
+| Fixed scale `0.003` | 15/20 | 17/20 | 3/20 | 2/20 | 2/20 | 155.7 |
+| Fixed scale `0.05` | 16/20 | 18/20 | 2/20 | 2/20 | 2/20 | 157.8 |
+| Dynamic Gate Step 100 | 14/20 | 18/20 | 2/20 | 4/20 | 2/20 | 150.6 |
+| Dynamic Gate Step 499 | 15/20 | 18/20 | 2/20 | 3/20 | 1/20 | 158.0 |
+
+严格配对：
+
+```text
+Dynamic-100 vs Fixed-0:    0 wins / 2 losses / 18 ties, exact McNemar p=0.5
+Dynamic-499 vs Fixed-0:    2 wins / 3 losses / 15 ties, exact McNemar p=1.0
+Dynamic-499 vs Fixed-0.05: 1 win  / 2 losses / 17 ties, exact McNemar p=1.0
+Dynamic-499 vs Dynamic-100: 2 wins / 1 loss   / 17 ties, exact McNemar p=1.0
+```
+
+Dynamic-499 相对 Fixed-0 的行为变化集中在 5 个任务：
+
+- 改善：chocolate pudding 从 post-grasp failure 变为成功；
+- 改善：salad dressing level5 sample4 从 wrong-object 变为成功；
+- 退化：alphabet soup level1 从成功变为 post-grasp failure；
+- 退化：salad dressing level5 sample1 从成功变为 post-grasp failure；
+- 退化：orange juice level4 从成功变为 post-grasp failure。
+
+P2 结论：
+
+- 动态 gate 能读取 action/state/time 并产生差异，也出现了一个真实 wrong-object 修复案例；
+- 仅使用 flow-matching loss 时，优化会把 gate 整体推向开启，而不是学习抓取后衰减；
+- object grounding 的局部收益被新增 post-grasp failure 抵消，最终 success 低于无注入对照；
+- 当前证据不支持“无额外约束的动态 gate”解决阶段冲突，应进入 P3，为策略偏移加入显式保持约束；
+- P2 结果属于失败但有效的机制验证，不应通过继续训练、挑单个任务或扩大 gate 网络掩盖。
 
 ### P3：加入策略保持约束
 

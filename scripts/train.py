@@ -157,15 +157,21 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        if hasattr(model, "compute_loss_with_metrics"):
+            chunked_loss, model_metrics = model.compute_loss_with_metrics(rng, observation, actions, train=True)
+        else:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            model_metrics = {}
+        return jnp.mean(chunked_loss), model_metrics
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, model_metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -197,13 +203,16 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **model_metrics,
     }
-    if getattr(model, "object_condition_use_gate", False):
+    if getattr(model, "object_condition_use_gate", False) and not getattr(
+        model, "object_condition_dynamic_gate", False
+    ):
         raw_gate = model.object_condition_gate.value
         gate = jax.nn.sigmoid(raw_gate)
         info["object_condition_gate_raw"] = raw_gate
         info["object_condition_gate"] = gate
-        info["object_condition_effective_scale"] = gate
+        info["object_condition_effective_scale"] = model.object_condition_residual_scale * gate
     return new_state, info
 
 
@@ -279,7 +288,7 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0 or step == config.num_train_steps - 1:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            info_str = ", ".join(f"{k}={v:.6g}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []

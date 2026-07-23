@@ -1,4 +1,5 @@
 from flax import nnx
+from flax import serialization
 from flax import traverse_util
 import jax
 import jax.numpy as jnp
@@ -220,34 +221,6 @@ def test_resize_target_crop_requires_rgb_channels():
         _model._resize_target_crop(jnp.zeros((1, 16, 16, 1), dtype=jnp.float32), (224, 224))
 
 
-def test_pi05_object_mask_freeze_filter():
-    config = _train_config.get_config("pi05_libero_object_mask")
-    abstract_model = nnx.eval_shape(config.model.create, jax.random.key(3))
-    trainable_state = nnx.state(abstract_model, config.trainable_filter).flat_state()
-    trainable_paths = ["/".join(str(part) for part in path) for path in trainable_state]
-
-    assert trainable_paths
-    assert any("object_condition_" in path for path in trainable_paths)
-    assert any("action_in_proj" in path for path in trainable_paths)
-    assert any("action_out_proj" in path for path in trainable_paths)
-    assert any("time_mlp" in path for path in trainable_paths)
-    assert any("PaliGemma/llm" in path and "_1" in path for path in trainable_paths)
-    assert not any("PaliGemma/img" in path for path in trainable_paths)
-    assert not any("PaliGemma/llm" in path and "_1" not in path for path in trainable_paths)
-
-
-def test_pi05_object_cross_attention_only_trains_object_condition():
-    config = _train_config.get_config("pi05_libero_object_cross_attention")
-    abstract_model = nnx.eval_shape(config.model.create, jax.random.key(3))
-    trainable_state = nnx.state(abstract_model, config.trainable_filter).flat_state()
-    trainable_paths = ["/".join(str(part) for part in path) for path in trainable_state]
-
-    assert trainable_paths
-    assert all("object_condition_" in path for path in trainable_paths)
-    assert any("object_condition_query_proj" in path for path in trainable_paths)
-    assert any("object_condition_output_proj" in path for path in trainable_paths)
-
-
 def test_pi05_object_2d_cross_attention_excludes_target_point():
     config = _train_config.get_config("pi05_libero_object_2d_cross_attention")
 
@@ -259,23 +232,92 @@ def test_pi05_object_2d_cross_attention_excludes_target_point():
     assert all("object_condition_" in path for path in trainable_paths)
 
 
-def test_pi05_object_2d_step1_enables_encoder_and_gate():
-    config = _train_config.get_config("pi05_libero_object_2d_step1")
+def test_pi05_object_2d_step1_gate0_uses_trainable_half_open_gate():
+    config = _train_config.get_config("pi05_libero_object_2d_step1_gate0")
 
     assert config.data.object_condition_keys == ("target_mask", "target_bbox", "target_crop")
     assert config.model.object_condition_encoder_layers == 2
     assert config.model.object_condition_use_gate
-    assert jnp.isclose(jax.nn.sigmoid(config.model.object_condition_gate_init), 0.01798621)
+    assert config.model.object_condition_gate_init == 0.0
+    assert config.model.object_condition_residual_scale == 0.1
+    assert jnp.isclose(
+        config.model.object_condition_residual_scale * jax.nn.sigmoid(config.model.object_condition_gate_init),
+        0.05,
+    )
 
-    abstract_model = nnx.eval_shape(config.model.create, jax.random.key(5))
-    traverse_util.flatten_dict(nnx.state(abstract_model).to_pure_dict(), sep="/")
+    abstract_model = nnx.eval_shape(config.model.create, jax.random.key(17))
     trainable_state = nnx.state(abstract_model, config.trainable_filter).flat_state()
     trainable_paths = ["/".join(str(part) for part in path) for path in trainable_state]
     assert trainable_paths
     assert all("object_condition_" in path for path in trainable_paths)
-    assert any("object_condition_encoder_qkv_projs" in path for path in trainable_paths)
-    assert any("object_condition_encoder_mlp_in" in path for path in trainable_paths)
     assert any("object_condition_gate" in path for path in trainable_paths)
+
+
+def test_pi05_object_2d_dynamic_gate_only_trains_dynamic_gate():
+    config = _train_config.get_config("pi05_libero_object_2d_dynamic_gate")
+
+    assert config.model.object_condition_dynamic_gate
+    assert config.model.object_condition_use_gate
+    assert jnp.isclose(
+        config.model.object_condition_residual_scale
+        * jax.nn.sigmoid(config.model.object_condition_dynamic_gate_bias_init),
+        0.003,
+        rtol=1e-5,
+    )
+
+    abstract_model = nnx.eval_shape(config.model.create, jax.random.key(21))
+    trainable_state = nnx.state(abstract_model, config.trainable_filter).flat_state()
+    trainable_paths = ["/".join(str(part) for part in path) for path in trainable_state]
+    assert trainable_paths
+    assert all("object_condition_dynamic_gate_" in path for path in trainable_paths)
+    assert any("object_condition_dynamic_gate_output_proj" in path for path in trainable_paths)
+    assert not any("object_condition_output_proj" in path for path in trainable_paths)
+    assert not any("object_condition_encoder_" in path for path in trainable_paths)
+
+
+def test_pi0_dynamic_gate_starts_uniform_then_uses_action_state_and_time():
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=3,
+        discrete_state_input=False,
+        object_condition_residual_scale=0.1,
+        object_condition_use_gate=True,
+        object_condition_dynamic_gate=True,
+        object_condition_dynamic_gate_bias_init=-3.4760987,
+    )
+    model = config.create(jax.random.key(22))
+    model.object_condition_output_proj.kernel.value = jnp.eye(1024, dtype=jnp.float32)
+    action_tokens = jax.random.normal(jax.random.key(23), (2, config.action_horizon, 1024))
+    object_condition = (
+        jax.random.normal(jax.random.key(24), (2, 3, 1024)),
+        jnp.ones((2, 3), dtype=jnp.bool_),
+        jnp.ones((2,), dtype=jnp.bool_),
+    )
+    state = jax.random.normal(jax.random.key(25), (2, config.action_dim))
+    time_features = jax.random.normal(jax.random.key(26), (2, 1024))
+
+    _, initial_metrics = model._cross_attend_object_condition(
+        action_tokens,
+        object_condition,
+        state=state,
+        time_features=time_features,
+        return_metrics=True,
+    )
+    assert jnp.isclose(initial_metrics["object_condition_effective_scale"], 0.003, rtol=1e-5)
+    assert jnp.isclose(initial_metrics["object_condition_gate_std"], 0.0)
+
+    model.object_condition_dynamic_gate_output_proj.kernel.value = (
+        jax.random.normal(jax.random.key(27), (1024, 1)) * 0.01
+    )
+    _, learned_metrics = model._cross_attend_object_condition(
+        action_tokens,
+        object_condition,
+        state=state,
+        time_features=time_features,
+        return_metrics=True,
+    )
+    assert learned_metrics["object_condition_gate_std"] > 0
+    assert learned_metrics["object_condition_gate_min"] < learned_metrics["object_condition_gate_max"]
 
 
 def test_pi05_object_2d_legacy_config_keeps_step1_disabled():
@@ -318,6 +360,8 @@ def test_pi0_step1_object_encoder_masks_tokens_and_starts_as_noop():
     conditioned = model._cross_attend_object_condition(action_tokens, object_condition)
     assert jnp.allclose(conditioned, action_tokens)
 
+    # Empty and dropped conditions must remain no-ops after the residual branch becomes nonzero.
+    model.object_condition_output_proj.kernel.value = jnp.eye(1024, dtype=jnp.float32)
     empty_obs = obs.replace(
         target_mask=jnp.zeros_like(target_mask),
         target_bbox=jnp.zeros((1, 4), dtype=jnp.float32),
@@ -329,6 +373,145 @@ def test_pi0_step1_object_encoder_masks_tokens_and_starts_as_noop():
     assert jnp.all(jnp.isfinite(empty_tokens))
     assert not jnp.any(empty_has_condition)
     assert jnp.allclose(model._cross_attend_object_condition(action_tokens, empty_condition), action_tokens)
+
+
+def test_pi0_step1_gate_keeps_residual_scale_as_hard_limit():
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=2,
+        discrete_state_input=False,
+        object_condition_residual_scale=0.1,
+        object_condition_use_gate=True,
+        object_condition_gate_init=-4.0,
+    )
+    model = config.create(jax.random.key(8))
+    model.object_condition_output_proj.kernel.value = jnp.eye(1024, dtype=jnp.float32)
+    model.object_condition_output_proj.bias.value = jnp.zeros((1024,), dtype=jnp.float32)
+
+    action_tokens = jax.random.normal(jax.random.key(9), (1, config.action_horizon, 1024))
+    object_tokens = jax.random.normal(jax.random.key(10), (1, 3, 1024))
+    object_condition = (
+        object_tokens,
+        jnp.ones((1, 3), dtype=jnp.bool_),
+        jnp.ones((1,), dtype=jnp.bool_),
+    )
+
+    conditioned, metrics = model._cross_attend_object_condition(action_tokens, object_condition, return_metrics=True)
+    effective_scale = config.object_condition_residual_scale * jax.nn.sigmoid(config.object_condition_gate_init)
+
+    assert jnp.isclose(effective_scale, 0.001798621, rtol=1e-5)
+    assert metrics["object_condition_delta_rms"] > 0
+    assert jnp.allclose(
+        metrics["object_condition_residual_rms"],
+        effective_scale * metrics["object_condition_delta_rms"],
+        rtol=1e-4,
+    )
+    assert jnp.allclose(
+        jnp.sqrt(jnp.mean(jnp.square(conditioned - action_tokens))),
+        metrics["object_condition_residual_rms"],
+        rtol=1e-4,
+    )
+
+
+def test_pi0_object_condition_inference_scale_overrides_gate():
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=2,
+        discrete_state_input=False,
+        object_condition_residual_scale=0.1,
+        object_condition_inference_scale=0.003,
+        object_condition_use_gate=True,
+        object_condition_gate_init=10.0,
+    )
+    model = config.create(jax.random.key(18))
+    model.object_condition_output_proj.kernel.value = jnp.eye(1024, dtype=jnp.float32)
+    model.object_condition_output_proj.bias.value = jnp.zeros((1024,), dtype=jnp.float32)
+    action_tokens = jax.random.normal(jax.random.key(19), (1, config.action_horizon, 1024))
+    object_condition = (
+        jax.random.normal(jax.random.key(20), (1, 3, 1024)),
+        jnp.ones((1, 3), dtype=jnp.bool_),
+        jnp.ones((1,), dtype=jnp.bool_),
+    )
+
+    _, metrics = model._cross_attend_object_condition(action_tokens, object_condition, return_metrics=True)
+
+    assert metrics["object_condition_delta_rms"] > 0
+    assert jnp.allclose(
+        metrics["object_condition_residual_rms"],
+        0.003 * metrics["object_condition_delta_rms"],
+        rtol=1e-4,
+    )
+
+
+def test_pi0_step1_gate_and_output_projection_have_finite_gradients():
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=2,
+        discrete_state_input=False,
+        object_condition_use_gate=True,
+    )
+    model = config.create(jax.random.key(11))
+    model.object_condition_output_proj.kernel.value = jnp.eye(1024, dtype=jnp.float32) * 0.01
+
+    action_tokens = jax.random.normal(jax.random.key(12), (1, config.action_horizon, 1024))
+    object_condition = (
+        jax.random.normal(jax.random.key(13), (1, 3, 1024)),
+        jnp.ones((1, 3), dtype=jnp.bool_),
+        jnp.ones((1,), dtype=jnp.bool_),
+    )
+
+    def loss_fn(model):
+        conditioned = model._cross_attend_object_condition(action_tokens, object_condition)
+        return jnp.mean(jnp.square(conditioned))
+
+    diff_state = nnx.DiffState(
+        0,
+        nnx.Any(
+            nnx_utils.PathRegex("object_condition_gate"),
+            nnx_utils.PathRegex("object_condition_output_proj/.*"),
+        ),
+    )
+    _, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model)
+    flat_grads = traverse_util.flatten_dict(grads.to_pure_dict(), sep="/")
+    gate_grad = flat_grads["object_condition_gate"]
+    output_kernel_grad = flat_grads["object_condition_output_proj/kernel"]
+
+    assert jnp.all(jnp.isfinite(gate_grad))
+    assert jnp.all(jnp.isfinite(output_kernel_grad))
+    assert jnp.any(jnp.abs(gate_grad) > 0)
+    assert jnp.any(jnp.abs(output_kernel_grad) > 0)
+
+
+def test_pi0_step1_params_roundtrip_preserves_conditioned_output():
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=2,
+        discrete_state_input=False,
+        object_condition_use_gate=True,
+    )
+    model = config.create(jax.random.key(14))
+    model.object_condition_output_proj.kernel.value = jnp.eye(1024, dtype=jnp.float32) * 0.01
+    action_tokens = jax.random.normal(jax.random.key(15), (1, config.action_horizon, 1024))
+    object_condition = (
+        jax.random.normal(jax.random.key(16), (1, 3, 1024)),
+        jnp.ones((1, 3), dtype=jnp.bool_),
+        jnp.ones((1,), dtype=jnp.bool_),
+    )
+    expected = model._cross_attend_object_condition(action_tokens, object_condition)
+
+    object_state = nnx.state(model, nnx_utils.PathRegex("object_condition_.*"))
+    object_params = object_state.to_pure_dict()
+    serialized = serialization.to_bytes(object_params)
+    model.object_condition_gate.value = jnp.asarray(2.0, dtype=jnp.float32)
+    model.object_condition_output_proj.kernel.value = jnp.zeros_like(model.object_condition_output_proj.kernel.value)
+    perturbed = model._cross_attend_object_condition(action_tokens, object_condition)
+    restored_params = serialization.from_bytes(object_params, serialized)
+    object_state.replace_by_pure_dict(restored_params)
+    nnx.update(model, object_state)
+    actual = model._cross_attend_object_condition(action_tokens, object_condition)
+
+    assert not jnp.array_equal(perturbed, expected)
+    assert jnp.array_equal(actual, expected)
 
 
 def test_pi05_loads_legacy_checkpoint_without_object_encoder():

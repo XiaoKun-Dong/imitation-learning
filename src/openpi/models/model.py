@@ -244,6 +244,11 @@ class Observation(Generic[ArrayT]):
     # 3D target point [x, y, z] derived from depth, in the camera/world frame
     # chosen by the dataset conversion pipeline.
     target_point: at.Float[ArrayT, "b 3"] | None = None
+    # Optional detector/segmenter confidence in [0, 1].
+    object_condition_confidence: at.Float[ArrayT, "b 1"] | None = None
+    # Optional precomputed frozen semantic patch tokens (for example DINOv2).
+    # Exclude the CLS token; the patch count must form a square grid.
+    object_semantic_tokens: at.Float[ArrayT, "b n d"] | None = None
 
     # pi0-fast model specific fields.
 
@@ -284,6 +289,8 @@ class Observation(Generic[ArrayT]):
             target_bbox=data.get("target_bbox"),
             target_crop=target_crop,
             target_point=data.get("target_point"),
+            object_condition_confidence=data.get("object_condition_confidence"),
+            object_semantic_tokens=data.get("object_semantic_tokens"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -388,6 +395,8 @@ def preprocess_observation(
             target_bbox=target_bbox,
             target_crop=target_crop,
             target_point=observation.target_point,
+            object_condition_confidence=observation.object_condition_confidence,
+            object_semantic_tokens=observation.object_semantic_tokens,
             token_ar_mask=observation.token_ar_mask,
             token_loss_mask=observation.token_loss_mask,
         )

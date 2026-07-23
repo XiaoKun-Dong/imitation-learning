@@ -97,6 +97,10 @@ class LiberoInputs(transforms.DataTransformFn):
             inputs["target_crop"] = _parse_image(data["target_crop"])
         if "target_point" in data:
             inputs["target_point"] = np.asarray(data["target_point"], dtype=np.float32)
+        if "object_condition_confidence" in data:
+            inputs["object_condition_confidence"] = np.asarray(data["object_condition_confidence"], dtype=np.float32)
+        if "object_semantic_tokens" in data:
+            inputs["object_semantic_tokens"] = np.asarray(data["object_semantic_tokens"], dtype=np.float32)
 
         # Pass the prompt (aka language instruction) to the model.
         # Keep this for your own dataset (but modify the key if the instruction is not
