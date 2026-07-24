@@ -15,10 +15,6 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
-OBJECT_CONDITION_GRID_SIZE = 16
-OBJECT_CONDITION_PATCH_DIM = 6  # RGB crop, mask, and normalized x/y coordinates.
-OBJECT_CONDITION_GEOMETRY_DIM = 12  # bbox, mask moments, and target point.
-
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -71,14 +67,6 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
-        self.object_condition_dropout_rate = config.object_condition_dropout_rate
-        self.object_condition_num_heads = config.object_condition_num_heads
-        self.object_condition_residual_scale = config.object_condition_residual_scale
-        self.object_condition_inference_scale = config.object_condition_inference_scale
-        self.object_condition_encoder_layers = config.object_condition_encoder_layers
-        self.object_condition_use_gate = config.object_condition_use_gate
-        self.object_condition_dynamic_gate = config.object_condition_dynamic_gate
-        self.object_condition_dynamic_gate_bias = config.object_condition_dynamic_gate_bias_init
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -110,293 +98,9 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
-        if action_expert_config.width % self.object_condition_num_heads != 0:
-            raise ValueError("action expert width must be divisible by object_condition_num_heads")
-        self.object_condition_patch_proj = nnx.Linear(OBJECT_CONDITION_PATCH_DIM, action_expert_config.width, rngs=rngs)
-        self.object_condition_geometry_proj = nnx.Linear(
-            OBJECT_CONDITION_GEOMETRY_DIM, action_expert_config.width, rngs=rngs
-        )
-        encoder_width = action_expert_config.width
-        encoder_mlp_width = encoder_width * config.object_condition_encoder_mlp_ratio
-        layer_names = [f"layer_{layer}" for layer in range(self.object_condition_encoder_layers)]
-        self.object_condition_encoder_attn_norms = {
-            name: nnx.LayerNorm(encoder_width, rngs=rngs) for name in layer_names
-        }
-        self.object_condition_encoder_qkv_projs = {
-            name: nnx.Linear(encoder_width, 3 * encoder_width, rngs=rngs) for name in layer_names
-        }
-        self.object_condition_encoder_out_projs = {
-            name: nnx.Linear(encoder_width, encoder_width, rngs=rngs) for name in layer_names
-        }
-        self.object_condition_encoder_mlp_norms = {
-            name: nnx.LayerNorm(encoder_width, rngs=rngs) for name in layer_names
-        }
-        self.object_condition_encoder_mlp_in = {
-            name: nnx.Linear(encoder_width, encoder_mlp_width, rngs=rngs) for name in layer_names
-        }
-        self.object_condition_encoder_mlp_out = {
-            name: nnx.Linear(encoder_mlp_width, encoder_width, rngs=rngs) for name in layer_names
-        }
-        self.object_condition_query_proj = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        self.object_condition_key_proj = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        self.object_condition_value_proj = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        # Zero initialization makes a legacy policy's initial behavior exactly unchanged.
-        self.object_condition_output_proj = nnx.Linear(
-            action_expert_config.width,
-            action_expert_config.width,
-            kernel_init=nnx.initializers.zeros,
-            bias_init=nnx.initializers.zeros,
-            rngs=rngs,
-        )
-        if self.object_condition_use_gate:
-            self.object_condition_gate = nnx.Param(jnp.asarray(config.object_condition_gate_init, dtype=jnp.float32))
-        if self.object_condition_dynamic_gate:
-            self.object_condition_dynamic_gate_action_norm = nnx.LayerNorm(action_expert_config.width, rngs=rngs)
-            self.object_condition_dynamic_gate_state_proj = nnx.Linear(
-                config.action_dim, action_expert_config.width, rngs=rngs
-            )
-            self.object_condition_dynamic_gate_time_proj = nnx.Linear(
-                action_expert_config.width, action_expert_config.width, rngs=rngs
-            )
-            self.object_condition_dynamic_gate_output_proj = nnx.Linear(
-                action_expert_config.width,
-                1,
-                kernel_init=nnx.initializers.zeros,
-                bias_init=nnx.initializers.zeros,
-                rngs=rngs,
-            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
-
-    def _resize_object_map(
-        self, x: at.Float[at.Array, "b h w c"], *, method: jax.image.ResizeMethod
-    ) -> at.Float[at.Array, "b 16 16 c"]:
-        return jax.image.resize(
-            x,
-            (x.shape[0], OBJECT_CONDITION_GRID_SIZE, OBJECT_CONDITION_GRID_SIZE, x.shape[-1]),
-            method=method,
-        )
-
-    def _embed_object_condition(
-        self, obs: _model.Observation
-    ) -> (
-        tuple[
-            at.Float[at.Array, "b object_s emb"],
-            at.Bool[at.Array, "b object_s"],
-            at.Bool[at.Array, " b"],
-        ]
-        | None
-    ):
-        """Encode spatial object patches and geometry as cross-attention tokens."""
-        if obs.target_mask is None and obs.target_bbox is None and obs.target_crop is None and obs.target_point is None:
-            return None
-
-        batch_size = obs.state.shape[0]
-        crop_grid = jnp.zeros(
-            (batch_size, OBJECT_CONDITION_GRID_SIZE, OBJECT_CONDITION_GRID_SIZE, 3),
-            dtype=jnp.float32,
-        )
-        mask_grid = jnp.zeros(
-            (batch_size, OBJECT_CONDITION_GRID_SIZE, OBJECT_CONDITION_GRID_SIZE, 1),
-            dtype=jnp.float32,
-        )
-        bbox_features = jnp.zeros((batch_size, 4), dtype=jnp.float32)
-        point_features = jnp.zeros((batch_size, 3), dtype=jnp.float32)
-
-        if obs.target_crop is not None:
-            crop = jnp.asarray(obs.target_crop, dtype=jnp.float32)
-            crop_grid = self._resize_object_map(crop, method=jax.image.ResizeMethod.LINEAR)
-
-        if obs.target_bbox is not None:
-            bbox_scale = jnp.asarray([_model.IMAGE_RESOLUTION[1], _model.IMAGE_RESOLUTION[0]] * 2, dtype=jnp.float32)
-            bbox_features = jnp.asarray(obs.target_bbox, dtype=jnp.float32) / bbox_scale
-
-        if obs.target_point is not None:
-            point_features = jnp.asarray(obs.target_point, dtype=jnp.float32)
-
-        if obs.target_mask is not None:
-            mask = jnp.asarray(obs.target_mask[..., None], dtype=jnp.float32)
-            mask_grid = self._resize_object_map(mask, method=jax.image.ResizeMethod.NEAREST)
-
-        # Spatial moments give the action expert an explicit coarse target center,
-        # extent, and visible area even when target_crop is missing.
-        flat_mask = mask_grid[..., 0].reshape(batch_size, -1)
-        area = jnp.mean(flat_mask, axis=-1, keepdims=True)
-        ys = jnp.linspace(0.0, 1.0, OBJECT_CONDITION_GRID_SIZE, dtype=jnp.float32)
-        xs = jnp.linspace(0.0, 1.0, OBJECT_CONDITION_GRID_SIZE, dtype=jnp.float32)
-        yy, xx = jnp.meshgrid(ys, xs, indexing="ij")
-        flat_x = xx.reshape(1, -1)
-        flat_y = yy.reshape(1, -1)
-        denom = jnp.sum(flat_mask, axis=-1, keepdims=True) + 1e-6
-        cx = jnp.sum(flat_mask * flat_x, axis=-1, keepdims=True) / denom
-        cy = jnp.sum(flat_mask * flat_y, axis=-1, keepdims=True) / denom
-        var_x = jnp.sum(flat_mask * jnp.square(flat_x - cx), axis=-1, keepdims=True) / denom
-        var_y = jnp.sum(flat_mask * jnp.square(flat_y - cy), axis=-1, keepdims=True) / denom
-        mask_features = jnp.concatenate([area, cx, cy, var_x, var_y], axis=-1)
-
-        coordinates = jnp.stack([xx, yy], axis=-1)
-        coordinates = jnp.broadcast_to(coordinates, (*crop_grid.shape[:3], 2))
-        patch_features = jnp.concatenate([crop_grid, mask_grid, coordinates], axis=-1)
-        patch_features = patch_features.reshape(batch_size, -1, OBJECT_CONDITION_PATCH_DIM)
-        patch_tokens = nnx.swish(self.object_condition_patch_proj(patch_features))
-
-        geometry_features = jnp.concatenate([bbox_features, mask_features, point_features], axis=-1)
-        geometry_token = nnx.swish(self.object_condition_geometry_proj(geometry_features))[:, None, :]
-        object_tokens = jnp.concatenate([patch_tokens, geometry_token], axis=1)
-
-        patch_mask = (mask_grid[..., 0] > 0.5) | jnp.any(jnp.abs(crop_grid) > 0, axis=-1)
-        patch_mask = patch_mask.reshape(batch_size, -1)
-        object_token_mask = jnp.concatenate([patch_mask, jnp.ones((batch_size, 1), dtype=jnp.bool_)], axis=1)
-        object_tokens = self._encode_object_tokens(object_tokens, object_token_mask)
-
-        # Object dropout and missing segmentations must be true no-ops even though patch
-        # coordinates themselves are nonzero.
-        has_condition = (
-            jnp.any(jnp.abs(crop_grid) > 0, axis=(1, 2, 3))
-            | jnp.any(mask_grid > 0, axis=(1, 2, 3))
-            | jnp.any(jnp.abs(bbox_features) > 0, axis=1)
-            | jnp.any(jnp.abs(point_features) > 0, axis=1)
-        )
-        return object_tokens, object_token_mask, has_condition
-
-    def _encode_object_tokens(
-        self,
-        object_tokens: at.Float[at.Array, "b object_s emb"],
-        object_token_mask: at.Bool[at.Array, "b object_s"],
-    ) -> at.Float[at.Array, "b object_s emb"]:
-        """Contextualize valid object tokens with lightweight masked self-attention."""
-        token_mask = object_token_mask[..., None].astype(object_tokens.dtype)
-        x = object_tokens * token_mask
-        num_heads = self.object_condition_num_heads
-        head_dim = x.shape[-1] // num_heads
-
-        for layer in range(self.object_condition_encoder_layers):
-            layer_name = f"layer_{layer}"
-            normalized = self.object_condition_encoder_attn_norms[layer_name](x)
-            qkv = self.object_condition_encoder_qkv_projs[layer_name](normalized)
-            query, key, value = jnp.split(qkv, 3, axis=-1)
-            query = einops.rearrange(query, "b s (h d) -> b h s d", h=num_heads)
-            key = einops.rearrange(key, "b s (h d) -> b h s d", h=num_heads)
-            value = einops.rearrange(value, "b s (h d) -> b h s d", h=num_heads)
-            logits = jnp.einsum("bhqd,bhkd->bhqk", query, key) * (head_dim**-0.5)
-            logits = jnp.where(object_token_mask[:, None, None, :], logits, -jnp.inf)
-            weights = jax.nn.softmax(logits, axis=-1)
-            attended = jnp.einsum("bhqk,bhkd->bhqd", weights, value)
-            attended = einops.rearrange(attended, "b h s d -> b s (h d)")
-            x = (x + self.object_condition_encoder_out_projs[layer_name](attended)) * token_mask
-
-            normalized = self.object_condition_encoder_mlp_norms[layer_name](x)
-            mlp_output = self.object_condition_encoder_mlp_out[layer_name](
-                nnx.swish(self.object_condition_encoder_mlp_in[layer_name](normalized))
-            )
-            x = (x + mlp_output) * token_mask
-
-        return x
-
-    def _cross_attend_object_condition(
-        self,
-        action_tokens: at.Float[at.Array, "b action_s emb"],
-        object_condition: tuple[
-            at.Float[at.Array, "b object_s emb"],
-            at.Bool[at.Array, "b object_s"],
-            at.Bool[at.Array, " b"],
-        ],
-        *,
-        state: at.Float[at.Array, "b state"] | None = None,
-        time_features: at.Float[at.Array, "b emb"] | None = None,
-        return_metrics: bool = False,
-    ):
-        """Let each action token independently retrieve target-object information."""
-        object_tokens, object_token_mask, has_condition = object_condition
-        query = self.object_condition_query_proj(action_tokens)
-        key = self.object_condition_key_proj(object_tokens)
-        value = self.object_condition_value_proj(object_tokens)
-
-        num_heads = self.object_condition_num_heads
-        head_dim = query.shape[-1] // num_heads
-        query = einops.rearrange(query, "b s (h d) -> b h s d", h=num_heads)
-        key = einops.rearrange(key, "b s (h d) -> b h s d", h=num_heads)
-        value = einops.rearrange(value, "b s (h d) -> b h s d", h=num_heads)
-        logits = jnp.einsum("bhqd,bhkd->bhqk", query, key) * (head_dim**-0.5)
-        logits = jnp.where(object_token_mask[:, None, None, :], logits, -jnp.inf)
-        weights = jax.nn.softmax(logits, axis=-1)
-        attended = jnp.einsum("bhqk,bhkd->bhqd", weights, value)
-        attended = einops.rearrange(attended, "b h s d -> b s (h d)")
-        delta = self.object_condition_output_proj(attended)
-        delta = delta * has_condition[:, None, None].astype(delta.dtype)
-        gate = None
-        if self.object_condition_inference_scale is not None:
-            effective_scale = jnp.asarray(self.object_condition_inference_scale, dtype=delta.dtype)
-        elif self.object_condition_dynamic_gate:
-            if state is None or time_features is None:
-                raise ValueError("Dynamic object gate requires state and time_features")
-            gate_features = self.object_condition_dynamic_gate_action_norm(action_tokens)
-            gate_features = gate_features + nnx.swish(self.object_condition_dynamic_gate_state_proj(state))[:, None, :]
-            gate_features = (
-                gate_features + nnx.swish(self.object_condition_dynamic_gate_time_proj(time_features))[:, None, :]
-            )
-            dynamic_logits = self.object_condition_dynamic_gate_output_proj(nnx.swish(gate_features))
-            gate = jax.nn.sigmoid(dynamic_logits.astype(jnp.float32) + self.object_condition_dynamic_gate_bias)
-            effective_scale = jnp.asarray(self.object_condition_residual_scale, dtype=delta.dtype) * gate.astype(
-                delta.dtype
-            )
-        else:
-            effective_scale = jnp.asarray(self.object_condition_residual_scale, dtype=delta.dtype)
-            if self.object_condition_use_gate:
-                gate = jax.nn.sigmoid(self.object_condition_gate.value)
-                effective_scale = effective_scale * gate
-        residual = effective_scale * delta
-        conditioned_tokens = action_tokens + residual
-        if not return_metrics:
-            return conditioned_tokens
-        metrics = {
-            "object_condition_action_token_rms": jnp.sqrt(jnp.mean(jnp.square(action_tokens.astype(jnp.float32)))),
-            "object_condition_delta_rms": jnp.sqrt(jnp.mean(jnp.square(delta.astype(jnp.float32)))),
-            "object_condition_residual_rms": jnp.sqrt(jnp.mean(jnp.square(residual.astype(jnp.float32)))),
-            "object_condition_effective_scale": jnp.mean(jnp.asarray(effective_scale, dtype=jnp.float32)),
-        }
-        if gate is not None:
-            gate = jnp.asarray(gate, dtype=jnp.float32)
-            metrics.update(
-                {
-                    "object_condition_gate": jnp.mean(gate),
-                    "object_condition_gate_min": jnp.min(gate),
-                    "object_condition_gate_max": jnp.max(gate),
-                    "object_condition_gate_std": jnp.std(gate),
-                }
-            )
-        return conditioned_tokens, metrics
-
-    def _drop_object_condition(
-        self, rng: at.KeyArrayLike, obs: _model.Observation, *, train: bool
-    ) -> _model.Observation:
-        """Drop object inputs per example during training for segmentation robustness."""
-        rate = self.object_condition_dropout_rate
-        if not train or rate == 0.0:
-            return obs
-        if obs.target_mask is None and obs.target_bbox is None and obs.target_crop is None and obs.target_point is None:
-            return obs
-
-        batch_size = obs.state.shape[0]
-        keep = jax.random.bernoulli(rng, 1.0 - rate, (batch_size,))
-
-        def apply_keep(value):
-            if value is None:
-                return None
-            keep_shape = (batch_size,) + (1,) * (value.ndim - 1)
-            keep_mask = keep.reshape(keep_shape)
-            if value.dtype == jnp.bool_:
-                return jnp.logical_and(value, keep_mask)
-            return value * keep_mask.astype(value.dtype)
-
-        with at.disable_typechecking():
-            return obs.replace(
-                target_mask=apply_keep(obs.target_mask),
-                target_bbox=apply_keep(obs.target_bbox),
-                target_crop=apply_keep(obs.target_crop),
-                target_point=apply_keep(obs.target_point),
-            )
 
     @at.typecheck
     def embed_prefix(
@@ -440,7 +144,6 @@ class Pi0(_model.BaseModel):
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
         at.Float[at.Array, "b emb"] | None,
-        dict[str, at.Float[at.Array, ""]],
     ]:
         input_mask = []
         ar_mask = []
@@ -456,7 +159,6 @@ class Pi0(_model.BaseModel):
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
-        object_cond = self._embed_object_condition(obs)
         if self.pi05:
             # time MLP (for adaRMS)
             time_emb = self.time_mlp_in(time_emb)
@@ -474,24 +176,6 @@ class Pi0(_model.BaseModel):
             action_time_tokens = self.action_time_mlp_out(action_time_tokens)
             action_expert_tokens = action_time_tokens
             adarms_cond = None
-
-        # Each action token retrieves the spatial/3D target information it needs.
-        object_metrics = {
-            "object_condition_action_token_rms": jnp.sqrt(
-                jnp.mean(jnp.square(action_expert_tokens.astype(jnp.float32)))
-            ),
-            "object_condition_delta_rms": jnp.asarray(0.0, dtype=jnp.float32),
-            "object_condition_residual_rms": jnp.asarray(0.0, dtype=jnp.float32),
-        }
-        if object_cond is not None:
-            action_expert_tokens, object_metrics = self._cross_attend_object_condition(
-                action_expert_tokens,
-                object_cond,
-                state=obs.state,
-                time_features=time_emb,
-                return_metrics=True,
-            )
-
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
@@ -499,14 +183,14 @@ class Pi0(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask, adarms_cond, object_metrics
+        return tokens, input_mask, ar_mask, adarms_cond
 
-    def _compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool
-    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Float[at.Array, ""]]]:
-        preprocess_rng, object_dropout_rng, noise_rng, time_rng = jax.random.split(rng, 4)
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        observation = self._drop_object_condition(object_dropout_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -515,10 +199,9 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, object_metrics = self.embed_suffix(
-            observation, x_t, time
-        )
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -527,19 +210,8 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1), object_metrics
 
-    @override
-    def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
-        loss, _ = self._compute_loss(rng, observation, actions, train=train)
-        return loss
-
-    def compute_loss_with_metrics(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Float[at.Array, ""]]]:
-        return self._compute_loss(rng, observation, actions, train=train)
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
     @override
     def sample_actions(
@@ -566,7 +238,7 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, _ = self.embed_suffix(
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
