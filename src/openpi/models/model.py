@@ -435,16 +435,30 @@ class BaseModelConfig(abc.ABC):
         flat_expected = traverse_util.flatten_dict(expected_params)
         flat_params = traverse_util.flatten_dict(params)
         missing_paths = set(flat_expected) - set(flat_params)
-        legacy_object_paths = {path for path in missing_paths if path and path[0].startswith("object_condition_")}
-        if legacy_object_paths == missing_paths:
-            loaded_has_object_params = any(path and path[0].startswith("object_condition_") for path in flat_params)
-            if loaded_has_object_params and legacy_object_paths:
+        adapter_prefixes = ("object_condition_", "rovla_")
+        initializable_adapter_paths = {
+            path for path in missing_paths if path and path[0].startswith(adapter_prefixes)
+        }
+        if initializable_adapter_paths == missing_paths:
+            partially_loaded_prefixes = {
+                prefix
+                for prefix in adapter_prefixes
+                if any(path and path[0].startswith(prefix) for path in flat_params)
+                and any(path and path[0].startswith(prefix) for path in initializable_adapter_paths)
+            }
+            if partially_loaded_prefixes:
                 raise ValueError(
-                    "Object-condition checkpoint is missing parameters required by this model config. "
+                    "Adapter checkpoint is missing parameters required by this model config "
+                    f"for prefixes {sorted(partially_loaded_prefixes)}. "
                     "Use the checkpoint's original config or an explicit migration."
                 )
-            for path in legacy_object_paths:
-                flat_params[path] = flat_expected[path]
+            for path in initializable_adapter_paths:
+                expected = flat_expected[path]
+                # `model` was created under eval_shape, so missing leaves are
+                # ShapeDtypeStruct objects rather than valid runtime arrays.
+                # Zero materialization gives legacy checkpoints a strict no-op
+                # adapter for inference; training uses the concrete weight loader.
+                flat_params[path] = jnp.zeros(expected.shape, expected.dtype)
             params = traverse_util.unflatten_dict(flat_params)
 
         at.check_pytree_equality(expected=expected_params, got=params, check_shapes=True, check_dtypes=False)

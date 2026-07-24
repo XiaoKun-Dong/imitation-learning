@@ -1,4 +1,6 @@
 import dataclasses
+from collections.abc import Mapping
+from typing import Protocol
 
 import einops
 import numpy as np
@@ -39,6 +41,24 @@ def _parse_mask(mask) -> np.ndarray:
     return mask > 0
 
 
+def _crop_from_bbox(image: np.ndarray, bbox: np.ndarray) -> np.ndarray:
+    x1, y1, x2, y2 = np.asarray(bbox, dtype=np.int32)
+    crop = np.zeros_like(image)
+    if x2 <= x1 or y2 <= y1:
+        return crop
+    height, width = image.shape[:2]
+    x1, x2 = np.clip([x1, x2], 0, width)
+    y1, y2 = np.clip([y1, y2], 0, height)
+    crop[y1:y2, x1:x2] = image[y1:y2, x1:x2]
+    return crop
+
+
+class ObjectConditionProvider(Protocol):
+    """Produces online target-object fields from the current base camera image."""
+
+    def __call__(self, image: np.ndarray, *, prompt: str | None = None) -> Mapping[str, np.ndarray | float]: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class LiberoInputs(transforms.DataTransformFn):
     """
@@ -51,6 +71,9 @@ class LiberoInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     # Do not change this for your own dataset.
     model_type: _model.ModelType
+    # Optional online detector/segmenter hook. For example, this can wrap a YOLO-seg
+    # worker and return target_mask, target_bbox, target_crop, and confidence.
+    object_condition_provider: ObjectConditionProvider | None = None
 
     def __call__(self, data: dict) -> dict:
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
@@ -87,20 +110,35 @@ class LiberoInputs(transforms.DataTransformFn):
         if "actions" in data:
             inputs["actions"] = data["actions"]
 
+        provider_outputs = {}
+        has_spatial_condition = any(key in data for key in ("target_mask", "target_bbox", "target_point"))
+        if self.object_condition_provider is not None and not has_spatial_condition:
+            provider_outputs = dict(
+                self.object_condition_provider(
+                    base_image,
+                    prompt=data.get("prompt"),
+                )
+            )
+
         # Optional object-centric inputs for the pi0.5 mask experiment.
         # These are aligned to observation/image and are consumed only by the action expert.
-        if "target_mask" in data:
-            inputs["target_mask"] = _parse_mask(data["target_mask"])
-        if "target_bbox" in data:
-            inputs["target_bbox"] = np.asarray(data["target_bbox"], dtype=np.float32)
-        if "target_crop" in data:
-            inputs["target_crop"] = _parse_image(data["target_crop"])
-        if "target_point" in data:
-            inputs["target_point"] = np.asarray(data["target_point"], dtype=np.float32)
-        if "object_condition_confidence" in data:
-            inputs["object_condition_confidence"] = np.asarray(data["object_condition_confidence"], dtype=np.float32)
-        if "object_semantic_tokens" in data:
-            inputs["object_semantic_tokens"] = np.asarray(data["object_semantic_tokens"], dtype=np.float32)
+        object_data = {**provider_outputs, **data}
+        if "target_mask" in object_data:
+            inputs["target_mask"] = _parse_mask(object_data["target_mask"])
+        if "target_bbox" in object_data:
+            inputs["target_bbox"] = np.asarray(object_data["target_bbox"], dtype=np.float32)
+        if "target_crop" in object_data:
+            inputs["target_crop"] = _parse_image(object_data["target_crop"])
+        elif "target_bbox" in object_data:
+            inputs["target_crop"] = _crop_from_bbox(base_image, inputs["target_bbox"])
+        if "target_point" in object_data:
+            inputs["target_point"] = np.asarray(object_data["target_point"], dtype=np.float32)
+        if "object_condition_confidence" in object_data:
+            inputs["object_condition_confidence"] = np.asarray(
+                object_data["object_condition_confidence"], dtype=np.float32
+            )
+        if "object_semantic_tokens" in object_data:
+            inputs["object_semantic_tokens"] = np.asarray(object_data["object_semantic_tokens"], dtype=np.float32)
 
         # Pass the prompt (aka language instruction) to the model.
         # Keep this for your own dataset (but modify the key if the instruction is not
