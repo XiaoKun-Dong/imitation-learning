@@ -49,20 +49,27 @@ class Policy(BasePolicy):
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
-        self._sample_kwargs = sample_kwargs or {}
+        self._sample_kwargs = dict(sample_kwargs or {})
+        self._interaction_diagnostics = bool(self._sample_kwargs.pop("interaction_diagnostics", False))
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
 
         if self._is_pytorch_model:
-            import torch
-
+            if self._interaction_diagnostics:
+                raise ValueError("interaction_diagnostics is only supported by JAX DemoVLA models")
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._sample_actions_with_interaction_diagnostics = None
+            if self._interaction_diagnostics:
+                debug_method = getattr(model, "sample_actions_with_interaction_diagnostics", None)
+                if debug_method is None:
+                    raise ValueError("interaction_diagnostics requires a model with interaction diagnostic support")
+                self._sample_actions_with_interaction_diagnostics = nnx_utils.module_jit(debug_method)
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -97,10 +104,22 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        diagnostics = None
+        if self._interaction_diagnostics:
+            assert self._sample_actions_with_interaction_diagnostics is not None
+            actions, diagnostics = self._sample_actions_with_interaction_diagnostics(
+                sample_rng_or_pytorch_device,
+                observation,
+                **sample_kwargs,
+            )
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
+        if diagnostics is not None:
+            outputs.update(diagnostics)
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
@@ -108,6 +127,8 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        if diagnostics is not None:
+            outputs["interaction_camera_names"] = list(observation.images)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

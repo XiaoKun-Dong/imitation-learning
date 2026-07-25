@@ -32,7 +32,7 @@ from PIL import ImageOps
 from robosuite.utils import camera_utils
 import tyro
 
-REPO_NAME = "your_hf_username/libero_object_mask"
+REPO_NAME = "your_hf_username/libero_object"
 DEFAULT_DATA_DIR = pathlib.Path("third_party/libero/LIBERO/libero/datasets/libero_object")
 DEFAULT_OUTPUT_ROOT = pathlib.Path("data/lerobot")
 IMAGE_SIZE = 128

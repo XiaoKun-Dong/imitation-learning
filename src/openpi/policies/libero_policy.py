@@ -121,4 +121,8 @@ class LiberoOutputs(transforms.DataTransformFn):
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][..., :7])}
+        outputs = {"actions": np.asarray(data["actions"][..., :7])}
+        # Preserve optional DemoVLA debug tensors so the rollout client can
+        # render query-to-patch attention without affecting normal policies.
+        outputs.update({key: value for key, value in data.items() if key.startswith("interaction_")})
+        return outputs

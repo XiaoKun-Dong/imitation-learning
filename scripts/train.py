@@ -1,6 +1,8 @@
 import dataclasses
 import functools
+import json
 import logging
+import pathlib
 import platform
 from typing import Any
 
@@ -26,6 +28,13 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+_DEMOVLA_PARAMS_FILTER = nnx_utils.PathRegex("demovla_.*")
+_DEMOVLA_INJECTION_FILTER = nnx_utils.PathRegex(
+    r"demovla_(action_query_.*|memory_(key|value)_proj.*|action_output_proj.*|interaction_gates)"
+)
+_DEMOVLA_EXTRACTOR_FILTER = nnx.All(_DEMOVLA_PARAMS_FILTER, nnx.Not(_DEMOVLA_INJECTION_FILTER))
+_DEMOVLA_OUTPUT_PROJ_FILTER = nnx_utils.PathRegex("demovla_action_output_proj/.*")
 
 
 def init_logging():
@@ -68,6 +77,12 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def _append_metrics_jsonl(path: pathlib.Path, step: int, metrics: dict[str, Any]) -> None:
+    record = {"step": step, **{key: np.asarray(value).item() for key, value in metrics.items()}}
+    with path.open("a", encoding="utf-8") as metrics_file:
+        metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -157,15 +172,29 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        model_metrics = {}
+        if hasattr(model, "compute_loss_with_aux"):
+            chunked_loss, model_metrics = model.compute_loss_with_aux(rng, observation, actions, train=True)
+        else:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        loss = jnp.mean(chunked_loss)
+        task_chunked_loss = chunked_loss - model_metrics.get("demovla_diversity_regularization", 0.0)
+        horizon_metrics = {
+            "loss_action_first": jnp.mean(task_chunked_loss[..., 0]),
+            "loss_action_middle": jnp.mean(task_chunked_loss[..., task_chunked_loss.shape[-1] // 2]),
+            "loss_action_last": jnp.mean(task_chunked_loss[..., -1]),
+            **model_metrics,
+        }
+        return loss, horizon_metrics
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, horizon_metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -195,9 +224,34 @@ def train_step(
     )
     info = {
         "loss": loss,
+        **horizon_metrics,
+        "learning_rate": config.lr_schedule.create()(state.step),
         "grad_norm": optax.global_norm(grads),
+        "update_norm": optax.global_norm(updates),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if hasattr(model, "demovla_interaction_gates"):
+        info.update(
+            {
+                "demovla_adapter_grad_norm": optax.global_norm(grads.filter(_DEMOVLA_PARAMS_FILTER)),
+                "demovla_adapter_param_norm": optax.global_norm(new_params.filter(_DEMOVLA_PARAMS_FILTER)),
+                "demovla_extractor_grad_norm": optax.global_norm(grads.filter(_DEMOVLA_EXTRACTOR_FILTER)),
+                "demovla_injection_grad_norm": optax.global_norm(grads.filter(_DEMOVLA_INJECTION_FILTER)),
+                "demovla_output_proj_grad_norm": optax.global_norm(grads.filter(_DEMOVLA_OUTPUT_PROJ_FILTER)),
+                "demovla_output_proj_update_norm": optax.global_norm(updates.filter(_DEMOVLA_OUTPUT_PROJ_FILTER)),
+                "demovla_output_proj_param_norm": optax.global_norm(new_params.filter(_DEMOVLA_OUTPUT_PROJ_FILTER)),
+            }
+        )
+        raw_gates = model.demovla_interaction_gates.value
+        gates = jax.nn.sigmoid(raw_gates)
+        info["demovla_gate_mean"] = jnp.mean(gates)
+        if model.interaction_injection_mode == "single_shot":
+            gate_labels = ("input",)
+        else:
+            gate_labels = tuple(f"layer_{layer}" for layer in model.interaction_injection_layers)
+        for label, raw_gate, gate in zip(gate_labels, raw_gates, gates, strict=True):
+            info[f"demovla_gate_{label}_raw"] = raw_gate
+            info[f"demovla_gate_{label}"] = gate
     if getattr(model, "object_condition_use_gate", False):
         raw_gate = model.object_condition_gate.value
         gate = jax.nn.sigmoid(raw_gate)
@@ -279,9 +333,16 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0 or step == config.num_train_steps - 1:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            latest_info = jax.device_get(infos[-1])
+            # Optimization statistics are averaged over the interval. State-like
+            # values should show the value at the current checkpoint boundary.
+            for key, value in latest_info.items():
+                if key == "learning_rate" or key.endswith("_param_norm") or "_gate_" in key:
+                    reduced_info[key] = value
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
+            _append_metrics_jsonl(config.checkpoint_dir / "metrics.jsonl", step, reduced_info)
             infos = []
         batch = next(data_iter)
 

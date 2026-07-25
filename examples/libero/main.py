@@ -21,6 +21,8 @@ from robosuite.utils import camera_utils
 import tqdm
 import tyro
 
+from openpi.models import demovla_visualization
+
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
@@ -56,6 +58,9 @@ class Args:
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
     debug_object_overlay: bool = False  # Overlay the live target mask and bbox on rollout videos.
+    visualize_interaction_patches: bool = False
+    # Save one interaction-attention panel per replan. Negative means all replans.
+    interaction_visualizations_per_episode: int = -1
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -121,6 +126,8 @@ def eval_libero(args: Args) -> None:
             replay_images = []
             target_grasped = False
             wrong_object_grasped = False
+            interaction_visualizations_saved = 0
+            replan_index = 0
             condition_object_name = None
             if args.object_condition == "2d_wrong":
                 condition_object_name = _object_condition.select_wrong_object(env)
@@ -195,7 +202,49 @@ def eval_libero(args: Args) -> None:
                                 element["target_point"] = target_point
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        policy_result = client.infer(element)
+                        action_chunk = policy_result["actions"]
+                        if args.visualize_interaction_patches and (
+                            args.interaction_visualizations_per_episode < 0
+                            or interaction_visualizations_saved < args.interaction_visualizations_per_episode
+                        ):
+                            required_diagnostics = {
+                                "interaction_camera_names",
+                                "interaction_visual_attention",
+                                "interaction_camera_mask",
+                                "interaction_patch_grid_shape",
+                            }
+                            missing_diagnostics = required_diagnostics - policy_result.keys()
+                            if missing_diagnostics:
+                                raise RuntimeError(
+                                    "Interaction visualization was requested, but the policy server did not return "
+                                    f"{sorted(missing_diagnostics)}. Start serve_policy.py with "
+                                    "--interaction-diagnostics."
+                                )
+                            debug_images = {
+                                "base_0_rgb": img,
+                                "left_wrist_0_rgb": wrist_img,
+                                "right_wrist_0_rgb": np.zeros_like(img),
+                            }
+                            task_segment = task_description.replace(" ", "_")
+                            episode_interaction_dir = (
+                                pathlib.Path(args.video_out_path)
+                                / "interaction_patches"
+                                / f"task_{task_id + 1:04d}_{task_segment}_episode_{episode_idx:02d}"
+                            )
+                            demovla_visualization.save_interaction_attention_replan(
+                                images=debug_images,
+                                camera_names=policy_result["interaction_camera_names"],
+                                visual_attention=policy_result["interaction_visual_attention"],
+                                camera_mask=policy_result["interaction_camera_mask"],
+                                patch_grid_shape=policy_result["interaction_patch_grid_shape"],
+                                output_dir=episode_interaction_dir,
+                                stem="interaction",
+                                replan_index=replan_index,
+                                env_step=t - args.num_steps_wait,
+                            )
+                            interaction_visualizations_saved += 1
+                        replan_index += 1
                         assert len(action_chunk) >= args.replan_steps, (
                             f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
                         )
