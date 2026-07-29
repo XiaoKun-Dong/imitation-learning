@@ -698,54 +698,36 @@ class DemoVLA(pi0.Pi0):
         top_k: int = 4,
     ) -> tuple[_model.Actions, dict[str, at.Array]]:
         """Sample actions and return the interaction patches for this replan."""
+        actions = self.sample_actions(
+            rng,
+            observation,
+            num_steps=num_steps,
+            noise=noise,
+        )
+        diagnostics = self.interaction_diagnostics(observation, top_k=top_k)
+        return actions, diagnostics
+
+    def interaction_diagnostics(
+        self,
+        observation: _model.Observation,
+        *,
+        top_k: int = 4,
+    ) -> dict[str, at.Array]:
+        """Return replan diagnostics without changing the action-sampling path."""
         if not self.use_interaction_memory:
             raise ValueError("interaction diagnostics require use_interaction_memory=True")
-        if num_steps <= 0:
-            raise ValueError(f"num_steps must be positive, got {num_steps}")
 
         observation = _model.preprocess_observation(None, observation, train=False)
-        dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
-        if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
-
-        prefix_length, prefix_mask, kv_cache, prefix_hidden = self._encode_prefix(observation)
-        interaction_memory, diagnostics = self.interaction_patch_diagnostics(
+        _, _, _, prefix_hidden = self._encode_prefix(observation)
+        _, diagnostics = self.interaction_patch_diagnostics(
             observation,
             prefix_hidden,
             top_k=top_k,
         )
-
-        def step(carry):
-            x_t, time = carry
-            batch_time = jnp.broadcast_to(time, (batch_size,))
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation,
-                x_t,
-                batch_time,
-                interaction_memory,
-            )
-            suffix_out = self._forward_action_expert(
-                suffix_tokens,
-                suffix_mask,
-                suffix_ar_mask,
-                adarms_cond,
-                prefix_length,
-                prefix_mask,
-                kv_cache,
-                interaction_memory,
-            )
-            velocity = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-            return x_t + dt * velocity, time + dt
-
-        def cond(carry):
-            _, time = carry
-            return time >= -dt / 2
-
-        actions, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         grid_height, grid_width = self._patch_grid_shape()
         diagnostics["interaction_patch_grid_shape"] = jnp.broadcast_to(
             jnp.asarray([grid_height, grid_width], dtype=jnp.int32),
             (batch_size, 2),
         )
-        return actions, diagnostics
+        return diagnostics

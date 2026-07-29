@@ -198,6 +198,13 @@ def test_demovla_loss_and_sampling_interfaces(demovla_model):
         ),
         model,
     )
+    diagnostics_only = nnx.eval_shape(
+        lambda module: module.interaction_diagnostics(
+            observation,
+            top_k=3,
+        ),
+        model,
+    )
 
     assert loss.shape == (1, config.action_horizon)
     assert loss_with_aux.shape == loss.shape
@@ -213,6 +220,8 @@ def test_demovla_loss_and_sampling_interfaces(demovla_model):
         256,
     )
     assert diagnostics["interaction_top_patch_xy"].shape == (1, config.num_interaction_tokens, 3, 2)
+    assert diagnostics_only["interaction_visual_attention"].shape == diagnostics["interaction_visual_attention"].shape
+    assert diagnostics_only["interaction_top_patch_xy"].shape == diagnostics["interaction_top_patch_xy"].shape
 
 
 def test_demovla_visualization_writes_one_replan_panel(tmp_path):

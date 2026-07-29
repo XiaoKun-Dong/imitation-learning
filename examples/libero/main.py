@@ -13,6 +13,7 @@ from libero.libero import get_libero_path
 from libero.libero.envs import SegmentationRenderEnv
 import numpy as np
 import object_condition as _object_condition
+from openpi_client import base_policy as _base_policy
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 from PIL import Image
@@ -63,9 +64,16 @@ class Args:
     interaction_visualizations_per_episode: int = -1
 
     seed: int = 7  # Random Seed (for reproducibility)
+    # Stateless flow-noise seed. Each replan uses
+    # (policy_noise_seed, benchmark_task_id, episode_idx, replan_idx).
+    # Set to None to restore the server's stateful RNG stream.
+    policy_noise_seed: int | None = 0
 
 
 def eval_libero(args: Args) -> None:
+    if args.policy_noise_seed is not None and not 0 <= args.policy_noise_seed <= np.iinfo(np.uint32).max:
+        raise ValueError("policy_noise_seed must be in [0, 2**32 - 1] or None")
+
     # Set random seed
     np.random.seed(args.seed)
 
@@ -75,6 +83,13 @@ def eval_libero(args: Args) -> None:
     selected_tasks = _select_tasks(args, task_suite)
     logging.info(f"Task suite: {args.task_suite_name}")
     logging.info("Selected %d / %d tasks", len(selected_tasks), task_suite.n_tasks)
+    if args.policy_noise_seed is None:
+        logging.warning("Policy flow noise uses the server's stateful RNG stream")
+    else:
+        logging.info(
+            "Policy flow noise is stateless: seed=%d, key=(seed, benchmark_task_id, episode, replan)",
+            args.policy_noise_seed,
+        )
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
     metrics_path = pathlib.Path(args.video_out_path) / "metrics.jsonl"
@@ -188,6 +203,16 @@ def eval_libero(args: Args) -> None:
                             ),
                             "prompt": str(task_description),
                         }
+                        if args.policy_noise_seed is not None:
+                            element[_base_policy.FLOW_NOISE_SEED_KEY] = np.asarray(
+                                [
+                                    args.policy_noise_seed,
+                                    task_id + 1,
+                                    episode_idx,
+                                    replan_index,
+                                ],
+                                dtype=np.uint32,
+                            )
                         if args.object_condition != "none":
                             assert target_condition is not None
                             target_mask, target_bbox, target_crop, target_point = target_condition
@@ -299,6 +324,7 @@ def eval_libero(args: Args) -> None:
                 "wrong_object_grasped": wrong_object_grasped,
                 "object_condition": args.object_condition,
                 "condition_object_name": condition_object_name,
+                "policy_noise_seed": args.policy_noise_seed,
                 "steps": t,
             }
             with metrics_path.open("a", encoding="utf-8") as f:

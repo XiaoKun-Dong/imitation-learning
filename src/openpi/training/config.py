@@ -841,8 +841,8 @@ _CONFIGS = [
         name="demovla_libero_single_shot",
         model=demovla.DemoVLAConfig(interaction_injection_mode="single_shot"),
         data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
+            repo_id="local/libero",
+            root="data/lerobot/local/libero",
             assets=AssetsConfig(
                 assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
                 asset_id="physical-intelligence/libero",
@@ -877,8 +877,8 @@ _CONFIGS = [
             interaction_injection_layers=(4, 9, 14),
         ),
         data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
+            repo_id="local/libero",
+            root="data/lerobot/local/libero",
             assets=AssetsConfig(
                 assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
                 asset_id="physical-intelligence/libero",
@@ -917,12 +917,8 @@ _CONFIGS = [
             interaction_memory_diversity_margin=0.5,
         ),
         data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            assets=AssetsConfig(
-                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
-                asset_id="physical-intelligence/libero",
-            ),
+            repo_id="local/libero",
+            root="data/lerobot/local/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),

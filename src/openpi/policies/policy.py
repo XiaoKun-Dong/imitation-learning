@@ -20,6 +20,25 @@ from openpi.shared import nnx_utils
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 
+def _deterministic_noise_from_seed_components(
+    seed_components: Sequence[int] | np.ndarray,
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    """Generate stateless Gaussian noise from stable integer seed components."""
+    components_array = np.asarray(seed_components)
+    if components_array.ndim != 1 or components_array.size == 0:
+        raise ValueError("flow noise seed must be a non-empty one-dimensional integer sequence")
+    if not np.issubdtype(components_array.dtype, np.integer):
+        raise ValueError("flow noise seed components must be integers")
+
+    components = [int(component) for component in components_array]
+    if any(component < 0 or component > np.iinfo(np.uint32).max for component in components):
+        raise ValueError("flow noise seed components must be in [0, 2**32 - 1]")
+
+    rng = np.random.default_rng(np.random.SeedSequence(components))
+    return rng.standard_normal(shape, dtype=np.float32)
+
+
 class Policy(BasePolicy):
     def __init__(
         self,
@@ -64,18 +83,43 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
-            self._sample_actions_with_interaction_diagnostics = None
+            self._interaction_diagnostics_fn = None
             if self._interaction_diagnostics:
-                debug_method = getattr(model, "sample_actions_with_interaction_diagnostics", None)
+                debug_method = getattr(model, "interaction_diagnostics", None)
                 if debug_method is None:
                     raise ValueError("interaction_diagnostics requires a model with interaction diagnostic support")
-                self._sample_actions_with_interaction_diagnostics = nnx_utils.module_jit(debug_method)
+                self._interaction_diagnostics_fn = nnx_utils.module_jit(debug_method)
             self._rng = rng or jax.random.key(0)
+
+    def _sample_actions_and_maybe_diagnostics(
+        self,
+        rng_or_device: at.KeyArrayLike | str,
+        observation: _model.Observation,
+        sample_kwargs: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """Use one action sampler regardless of whether diagnostics are enabled."""
+        actions = self._sample_actions(rng_or_device, observation, **sample_kwargs)
+        diagnostics = None
+        if self._interaction_diagnostics:
+            assert self._interaction_diagnostics_fn is not None
+            diagnostics = self._interaction_diagnostics_fn(observation)
+        return actions, diagnostics
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Remove protocol-only inputs before observation transforms see them.
+        flow_noise_seed = obs.get(_base_policy.FLOW_NOISE_SEED_KEY)
+        inputs = {key: value for key, value in obs.items() if key != _base_policy.FLOW_NOISE_SEED_KEY}
         # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = jax.tree.map(lambda x: x, inputs)
+        if flow_noise_seed is not None:
+            if noise is not None:
+                raise ValueError("provide either explicit noise or a flow noise seed, not both")
+            noise = _deterministic_noise_from_seed_components(
+                flow_noise_seed,
+                (self._model.action_horizon, self._model.action_dim),
+            )
+
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -104,16 +148,14 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        diagnostics = None
-        if self._interaction_diagnostics:
-            assert self._sample_actions_with_interaction_diagnostics is not None
-            actions, diagnostics = self._sample_actions_with_interaction_diagnostics(
-                sample_rng_or_pytorch_device,
-                observation,
-                **sample_kwargs,
-            )
-        else:
-            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        # Diagnostics must not select a different action-sampling graph. Always
+        # generate actions through the standard sampler, then compute diagnostics
+        # independently when requested.
+        actions, diagnostics = self._sample_actions_and_maybe_diagnostics(
+            sample_rng_or_pytorch_device,
+            observation,
+            sample_kwargs,
+        )
         outputs = {
             "state": inputs["state"],
             "actions": actions,

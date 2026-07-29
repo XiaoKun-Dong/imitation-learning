@@ -1,5 +1,9 @@
 # DemoVLA Sparse-Deep 训练报告
 
+> 本文记录无 diversity 的 30k sparse-deep 基线。带 attention/memory
+> diversity 的 10k 结果与 pilot rollout 见
+> [DemoVLA Sparse-Deep Diversity 10k 训练与评估报告](demovla_sparse_deep_diversity_10k.md)。
+
 ## 1. 实验概况
 
 本报告分析 DemoVLA sparse-deep adapter-only 实验的训练结果。

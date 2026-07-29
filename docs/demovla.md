@@ -4,13 +4,41 @@
 
 - 工作名称：DemoVLA
 - 基础模型：OpenPI `pi0.5`
-- 当前阶段：架构设计
+- 当前阶段：Sparse-deep diversity 10k 已完成训练和 50-episode 正式评估，进入基线补齐、失败分析与消融
+- 最新结果：[DemoVLA Sparse-Deep Diversity 10k 训练与评估报告](demovla_sparse_deep_diversity_10k.md)
+- 无 diversity 基线：[DemoVLA Sparse-Deep 30k 训练报告](demovla_sparse_deep_training_report.md)
 - 核心约束：
   - 不引入 SAM、DINO、GroundingDINO 等额外视觉模型。
   - 不要求 mask、bbox、crop、point 或 affordance 人工标注。
   - 推理输入保持为原始 RGB、语言指令和机器人状态。
   - 保留原始 VLM prefix 到 action expert 的信息通路。
   - 新增模块应支持从现有 `pi0.5` checkpoint 稳定初始化。
+
+### 1.1 已完成
+
+- 4-query、语言条件、空间与相机感知的 Interaction Token Extractor。
+- 在 Action Expert 第 4、9、14 层执行共享 adapter、独立 gate 的 sparse-deep injection。
+- Interaction memory 每次 replan 只提取一次，并在完整 flow denoising loop 中缓存。
+- Attention diversity loss 和 memory diversity loss，以及对应训练日志。
+- 以 replan 为时间单位的 query × camera patch attention 可视化。
+- Policy server、websocket diagnostics、LIBERO rollout、视频和 episode metrics 链路。
+- `demovla_libero_sparse_deep_diverse` adapter-only 训练到 10k。
+- 10-task、每任务 1 次、seed 7 的 `libero_object` pilot：9/10 成功，0 次目标
+  抓取失败，0 次错物抓取，1 次 post-grasp failure。
+- 10-task、每任务 5 次的正式评估：36/50 成功，成功率 72.0%，Wilson 95% CI
+  为 58.3%～82.5%。
+- 历史评估中与无 diversity 10k 对齐前 5 个 initial states：36/50 对 35/50，
+  McNemar `p=1.0`；但当时没有逐 replan 固定 flow noise，需要按新确定性协议
+  重跑后才能作为严格因果比较。
+
+### 1.2 尚未完成
+
+- 将 diverse 10k 扩展至每任务 10 次，缩小置信区间。
+- 若保留 3k checkpoint，则完成 3k/10k 对比；同时补齐 single-shot、vanilla
+  和 parameter-matched baseline 的相同 initial states 对比。
+- Attention grounding、query 分工和局部 collapse 的定量分析。
+- Layer 9 单层注入、query 数量、空间编码与参数共享消融。
+- Distractor、目标位置、背景、相机、遮挡和光照鲁棒性实验。
 
 ## 2. 研究动机
 
@@ -353,6 +381,39 @@ for flow_step in range(num_steps):
 禁止在 flow loop 中重复运行 SigLIP、VLM prefix 或 Interaction Token
 Extractor。新观测只在下一次 replan 时重新编码。
 
+### 9.1 确定性 Rollout Noise
+
+LIBERO 评估默认不再依赖 policy server 中跨请求累积的 RNG。每次 replan 使用
+以下稳定标识生成显式 Gaussian flow noise：
+
+```text
+(policy_noise_seed, benchmark_task_id, episode_idx, replan_idx)
+```
+
+默认：
+
+```text
+policy_noise_seed = 0
+```
+
+相同 checkpoint、observation 和四元组会获得逐元素一致的 noise；episode
+执行长短不会改变后续 episode 的 noise 序列。设为 `None` 可以恢复旧的
+stateful server RNG：
+
+```bash
+--args.policy-noise-seed None
+```
+
+请求通过保留字段 `_openpi_flow_noise_seed` 传递 seed components。
+`Policy.infer()` 在 observation transforms 前移除该字段，根据模型自身的
+`action_horizon` 和 `action_dim` 生成 noise，因此不会污染模型输入，也不需要
+在 client 硬编码 action shape。
+
+Diagnostics on/off 现在都使用标准 `sample_actions()` 生成动作。开启 diagnostics
+时，attention 由额外的 diagnostics-only forward 计算，不再切换到另一条动作
+采样图。因此 diagnostics 会增加分析模式的计算量，但不会有意改变 action；
+正式性能评估仍应关闭 diagnostics。
+
 ## 10. 与现有工作的区别
 
 ### ACoT-VLA
@@ -385,39 +446,32 @@ LiLo-VLA 使用外部物体位姿、motion planning、技能拆分和恢复模�
 
 ### `src/openpi/models/pi0.py`
 
-新增：
+保持原版 `pi0.5` 的 flow timestep、prefix cache 和 Action Expert 行为，不在
+该文件中加入 DemoVLA 专用逻辑。当前实现通过独立模型文件继承 `Pi0`，避免
+DemoVLA 实验污染基础模型。
+
+### `src/openpi/models/demovla.py`
+
+已实现：
 
 ```text
-InteractionTokenExtractor
-InteractionCrossAttentionAdapter
-interaction memory extraction
-sparse deep injection hook
+DemoVLAConfig
+language-conditioned interaction queries
+spatial and camera-aware visual retrieval
+single-shot / sparse-deep injection
+shared adapter with per-layer gates
+attention and memory diversity losses
+training auxiliary metrics
+replan-level interaction diagnostics
 ```
 
-现有 `_embed_object_condition()` 和 `_cross_attend_object_condition()` 不作为最终模型主路径。它们可以保留为 oracle object-condition ablation。
-
-### `src/openpi/models/gemma.py`
-
-需要为 Transformer block loop 增加可选的 action-token adapter hook，推荐接口：
+主要配置项位于 `DemoVLAConfig`：
 
 ```python
-interaction_memory: Array | None
-interaction_injection_layers: tuple[int, ...]
-interaction_adapter: Callable | None
-```
-
-hook 只更新 action expert 对应的 token group。
-
-不要让 `gemma.py` 直接依赖 DemoVLA 具体模块；Gemma 只负责在指定层调用通用 hook。
-
-### `src/openpi/models/pi0_config.py`
-
-建议配置项：
-
-```python
-use_interaction_memory: bool = False
+use_interaction_memory: bool = True
 num_interaction_tokens: int = 4
 interaction_num_heads: int = 8
+interaction_injection_mode: Literal["single_shot", "sparse_deep"] = "sparse_deep"
 interaction_injection_layers: tuple[int, ...] = (4, 9, 14)
 interaction_gate_init: float = -4.0
 interaction_adapter_share_weights: bool = True
@@ -427,9 +481,31 @@ interaction_memory_diversity_weight: float = 0.0
 interaction_memory_diversity_margin: float = 0.5
 ```
 
+### `src/openpi/models/gemma.py`
+
+已为 Transformer block loop 增加通用 `layer_adapter` hook：
+
+```python
+layer_adapter: Callable | None
+```
+
+DemoVLA 在指定层通过该 hook 更新 Action Expert token group。`gemma.py` 不依赖
+DemoVLA 模块，也不理解 interaction memory 的具体语义。
+
+### `scripts/train.py`
+
+已支持检测 `compute_loss_with_aux()`，将 total loss 用于反向传播，并分别记录
+flow loss、diversity loss 和 query cosine 指标。Action first/middle/last 会减去
+diversity regularization，保持为纯 action flow loss。
+
+### `src/openpi/training/weight_loaders.py`
+
+`CheckpointWeightLoader` 已支持配置 `missing_regex`，允许从基础 `pi0.5`
+checkpoint 加载已有参数，并为新增的 `demovla_.*` 参数保留模型初始化值。
+
 ### `src/openpi/training/config.py`
 
-新增：
+已新增：
 
 - adapter-only freeze filter；
 - DemoVLA 训练配置；
@@ -447,17 +523,33 @@ memory diversity weight    = 1e-4, margin = 0.5
 两个正则只惩罚 query pair cosine 超过 margin 的部分，允许不同 query 对目标
 区域保留必要的重叠，而不是强制完全正交。
 
-四卡训练：
+八卡训练示例：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 uv run python scripts/train.py demovla_libero_sparse_deep_diverse \
   --exp-name diverse_v1 \
-  --fsdp-devices 4
+  --fsdp-devices 4 \
+  --batch-size 128
 ```
 
-这里的 `batch_size=128` 是 global batch size。单机四卡时四张卡共同处理 128
-个样本；`--fsdp-devices 4` 同时将满足大小阈值的模型矩阵沿四卡切分。
+这里的 `batch_size=128` 是 global batch size。八张可见卡和
+`--fsdp-devices 4` 形成两个 data-parallel group，每组进行四卡 FSDP。
+
+### 推理、诊断与可视化
+
+以下文件已完成端到端诊断链路：
+
+```text
+src/openpi/models/demovla_visualization.py
+src/openpi/policies/policy.py
+src/openpi/policies/libero_policy.py
+scripts/serve_policy.py
+examples/libero/main.py
+```
+
+Policy server 可以选择返回 interaction diagnostics；LIBERO rollout 按 episode
+保存视频、`metrics.jsonl` 和每次 replan 的 query × camera patch attention 图。
 
 ## 12. 实验矩阵
 
@@ -565,6 +657,7 @@ CUDA_VISIBLE_DEVICES=0 \
   --args.object-condition none \
   --args.num-trials-per-task 1 \
   --args.seed 7 \
+  --args.policy-noise-seed 0 \
   --args.visualize-interaction-patches \
   --args.interaction-visualizations-per-episode -1 \
   --args.video-out-path data/libero/videos/demovla_diverse_debug
@@ -608,46 +701,71 @@ rollout 成功率确认去塌缩没有迫使 query 转向无关背景。
 
 ### 风险 5：修改 Gemma 增加维护成本
 
-先完成 single-shot 版本和正向结果，再实现通用 layer hook。不要在尚未验证 interaction token 有效前大规模修改 Transformer 内部。
+当前只在 Gemma layer loop 中保留一个与 DemoVLA 解耦的通用
+`layer_adapter` hook。后续需要持续用原始模型测试确认 `layer_adapter=None`
+时行为不变，避免 Gemma 接口继续扩张。
 
 ## 15. 分阶段实施
 
-### Phase 0：清理接口
+### Phase 0：清理接口（已完成）
 
-- 将现有外部 `target_*` 路径标记为 oracle ablation。
-- 新增 `use_interaction_memory` 开关。
-- 确保关闭开关时 checkpoint、loss 和 sampling 行为不变。
+- [x] DemoVLA 移入独立 `demovla.py`，不修改原始 `pi0.py` flow timestep 路径。
+- [x] 新增 `use_interaction_memory` 开关。
+- [x] 新 checkpoint 参数通过 `missing_regex` 与基础 `pi0.5` 权重兼容。
+- [x] 取消 Interaction Extractor 对 flow timestep 的额外 conditioning。
 
-### Phase 1：Single-Shot Baseline
+### Phase 1：Single-Shot Baseline（部分完成）
 
-- 从模型内部 visual/language tokens 提取 interaction tokens。
-- 在 action expert 输入前做一次 gated cross-attention。
-- 完成 Vanilla、global pooling、parameter-matched MLP 对照。
+- [x] 从模型内部 visual/language tokens 提取 interaction tokens。
+- [x] 在 Action Expert 输入前完成 single-shot gated cross-attention。
+- [x] 完成 single-shot 训练 checkpoint。
+- [ ] 使用当前数据与 seeds 重跑 Vanilla、global pooling 和 parameter-matched
+  MLP 对照。
 
-### Phase 2：Sparse Deep Injection
+### Phase 2：Sparse Deep Injection（已完成）
 
-- 在 Gemma layer loop 中加入通用 adapter hook。
-- 在 3 个 action expert 层注入共享 interaction adapter。
-- 验证 interaction memory 在 flow loop 外缓存。
+- [x] 在 Gemma layer loop 中加入通用 adapter hook。
+- [x] 在 Action Expert 第 4、9、14 层注入共享 interaction adapter。
+- [x] 三层使用独立 gate，并记录 layer-wise gate。
+- [x] 验证 interaction memory 在 flow loop 外缓存，每次 replan 重新提取。
 
-### Phase 3：鲁棒性和解释性
+### Phase 3：解释性（部分完成）
 
-- 增加 clutter、位置变化、遮挡和相机偏移评估。
-- 导出 interaction attention map 和各层 gate。
-- 判断是否需要 query diversity regularization。
+- [x] 导出每个 query、每个 camera 的 visual patch attention 和 top-k patch。
+- [x] 可视化时间单位从 flow timestep 改为 policy replan。
+- [x] 每个 episode 使用一个文件夹保存全部 replan 图片。
+- [x] 10k pilot 已生成 364 张诊断图。
+- [ ] 完成 target/goal coverage、attention temporal movement 和 query-pair
+  分工的定量分析。
 
-### Phase 4：Query Diversity
+### Phase 4：Query Diversity（实现、10k 训练与 50-episode 评估已完成）
 
-- 加入带 margin 的 attention diversity loss。
-- 加入权重更小的 memory diversity loss。
-- 记录 query pair cosine 与 replan attention top-k。
-- 对比无正则和 diverse 版本的成功率、目标选择错误率与背景误关注率。
+- [x] 加入带 margin 的 attention diversity loss。
+- [x] 加入权重更小的 memory diversity loss。
+- [x] 记录 query pair cosine 与 replan attention top-k。
+- [x] 完成 `demovla_libero_sparse_deep_diverse` 10k adapter-only 训练。
+- [x] 平均 attention cosine 从 `0.9956` 降至 `0.2007`，平均 memory cosine
+  从 `0.9715` 降至 `0.0010`。
+- [x] 完成 seed 7、10 tasks × 1 trial pilot，结果为 9/10。
+- [x] 完成 10 tasks × 5 trials 正式评估：36/50，成功率 72.0%。
+- [x] 历史 initial-state 对齐结果为 36/50 对 35/50，McNemar `p=1.0`；
+  已确认旧协议未逐 replan 固定 flow noise，不能作为严格因果消融。
+- [x] 新增由 `(policy_seed, task, episode, replan)` 驱动的 stateless flow
+  noise，并让 diagnostics on/off 共用标准 action sampler。
+- [ ] 扩展至每任务 10 次，并完成目标选择错误率与背景误关注率分析。
 
-### Phase 5：论文级消融
+### Phase 5：扩展评估、鲁棒性和论文级消融（下一阶段）
 
-- 完成 token 数量、注入深度、参数共享和训练策略消融。
-- 与 ACoT-style pooling 对齐参数和训练预算。
-- 汇总性能、计算成本和失败案例。
+- [ ] 将 diverse 10k 扩展到 100 episodes，与无 diversity 10k 完全对齐。
+- [ ] 若 3k checkpoint 可用，则与 10k 对比；补齐 single-shot、vanilla 和
+  parameter-matched adapter 的相同 initial states rollout。
+- [ ] 增加 query cosine p95、固定 pair matrix 和 layer-wise injection ratio。
+- [ ] 分析 BBQ sauce、ketchup、chocolate pudding 和 orange juice 的目标获取、
+  错物抓取与 post-grasp failure。
+- [ ] 完成 token 数量、Layer 9 单层注入、参数共享和训练策略消融。
+- [ ] 增加 distractor、位置、背景、相机、遮挡和光照鲁棒性评估。
+- [ ] 与 ACoT-style pooling 对齐参数和训练预算。
+- [ ] 汇总成功率置信区间、计算成本、grounding 和失败案例。
 
 ## 16. 成功标准
 
