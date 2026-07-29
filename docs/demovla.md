@@ -648,11 +648,10 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/serve_policy.py \
 运行 LIBERO rollout 并保存 patch 可视化：
 
 ```bash
-PYTHONPATH=third_party/libero/LIBERO \
 MUJOCO_GL=egl \
 MUJOCO_EGL_DEVICE_ID=0 \
 CUDA_VISIBLE_DEVICES=0 \
-.venv/bin/python examples/libero/main.py \
+uv run python examples/libero/main.py \
   --args.task-suite-name libero_object \
   --args.object-condition none \
   --args.num-trials-per-task 1 \

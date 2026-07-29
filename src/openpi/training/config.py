@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -34,6 +35,20 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+_PI05_BASE_CHECKPOINT = os.environ.get(
+    "OPENPI_PI05_BASE_CHECKPOINT",
+    "gs://openpi-assets/checkpoints/pi05_base",
+)
+_PI05_LIBERO_CHECKPOINT = os.environ.get(
+    "OPENPI_PI05_LIBERO_CHECKPOINT",
+    "gs://openpi-assets/checkpoints/pi05_libero",
+)
+_DEMOVLA_LIBERO_DATA_ROOT = os.environ.get("OPENPI_LIBERO_DATA_ROOT", "data/lerobot/local/libero")
+
+
+def _checkpoint_subdir(checkpoint_root: str, subdir: str) -> str:
+    return f"{checkpoint_root.rstrip('/')}/{subdir}"
 
 
 def _freeze_vla_backbone_filter() -> Filter:
@@ -625,7 +640,7 @@ def _make_pi05_libero_object_mask_ablation_config(
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_BASE_CHECKPOINT, "params")),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         freeze_filter=_freeze_vla_backbone_filter(),
         num_train_steps=30_000,
@@ -842,9 +857,9 @@ _CONFIGS = [
         model=demovla.DemoVLAConfig(interaction_injection_mode="single_shot"),
         data=LeRobotLiberoDataConfig(
             repo_id="local/libero",
-            root="data/lerobot/local/libero",
+            root=_DEMOVLA_LIBERO_DATA_ROOT,
             assets=AssetsConfig(
-                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
                 asset_id="physical-intelligence/libero",
             ),
             base_config=DataConfig(prompt_from_task=True),
@@ -861,7 +876,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/home/dongxiaokun/baseck/pi05_libero/params",
+            _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
             missing_regex=".*(lora|object_condition|demovla).*",
         ),
         freeze_filter=_freeze_all_except_demovla_filter(),
@@ -878,9 +893,9 @@ _CONFIGS = [
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="local/libero",
-            root="data/lerobot/local/libero",
+            root=_DEMOVLA_LIBERO_DATA_ROOT,
             assets=AssetsConfig(
-                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
                 asset_id="physical-intelligence/libero",
             ),
             base_config=DataConfig(prompt_from_task=True),
@@ -897,7 +912,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/home/dongxiaokun/baseck/pi05_libero/params",
+            _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
             missing_regex=".*(lora|object_condition|demovla).*",
         ),
         freeze_filter=_freeze_all_except_demovla_filter(),
@@ -918,7 +933,7 @@ _CONFIGS = [
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="local/libero",
-            root="data/lerobot/local/libero",
+            root=_DEMOVLA_LIBERO_DATA_ROOT,
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -933,7 +948,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/home/dongxiaokun/baseck/pi05_libero/params",
+            _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
             missing_regex=".*(lora|object_condition|demovla).*",
         ),
         freeze_filter=_freeze_all_except_demovla_filter(),
@@ -963,7 +978,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_BASE_CHECKPOINT, "params")),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         freeze_filter=_freeze_vla_backbone_filter(),
         num_train_steps=30_000,
@@ -977,7 +992,7 @@ _CONFIGS = [
             repo_id="local/libero_object_mask",
             root="data/lerobot/local/libero_object_mask",
             assets=AssetsConfig(
-                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
                 asset_id="physical-intelligence/libero",
             ),
             base_config=DataConfig(prompt_from_task=True),
@@ -994,7 +1009,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_libero/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params")),
         freeze_filter=_freeze_all_except_object_condition_filter(),
         num_train_steps=1_000,
         save_interval=250,
@@ -1009,7 +1024,7 @@ _CONFIGS = [
             repo_id="local/libero_object_mask",
             root="data/lerobot/local/libero_object_mask",
             assets=AssetsConfig(
-                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
                 asset_id="physical-intelligence/libero",
             ),
             base_config=DataConfig(prompt_from_task=True),
@@ -1026,7 +1041,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_libero/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params")),
         freeze_filter=_freeze_all_except_object_condition_filter(),
         num_train_steps=1_000,
         save_interval=250,
@@ -1048,7 +1063,7 @@ _CONFIGS = [
             repo_id="local/libero_object_mask",
             root="data/lerobot/local/libero_object_mask",
             assets=AssetsConfig(
-                assets_dir="/home/dongxiaokun/baseck/pi05_libero/assets",
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
                 asset_id="physical-intelligence/libero",
             ),
             base_config=DataConfig(prompt_from_task=True),
@@ -1065,7 +1080,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dongxiaokun/baseck/pi05_libero/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params")),
         freeze_filter=_freeze_all_except_object_condition_filter(),
         num_train_steps=5_000,
         save_interval=1_000,

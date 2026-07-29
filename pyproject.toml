@@ -1,7 +1,7 @@
 [project]
 name = "openpi"
 version = "0.1.0"
-description = "Physical Intelligence open source repo"
+description = "DemoVLA interaction-memory experiments built on OpenPI"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -14,7 +14,7 @@ dependencies = [
     "flax==0.10.2",
     "fsspec[gcs]>=2024.6.0",
     "gym-aloha>=0.1.1",
-    "imageio>=2.36.1",
+    "imageio[ffmpeg]>=2.36.1",
     "jax[cuda12]==0.5.3",
     "jaxtyping==0.2.36",
     "lerobot",
@@ -38,7 +38,8 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
-    "libero",
+    "mujoco==2.3.7",
+    "pyyaml>=6.0.2",
     "robosuite==1.4.1",
     "bddl",
     "easydict",
@@ -47,7 +48,7 @@ dependencies = [
 
 
 [project.urls]
-Repository = "https://github.com/Physical-Intelligence/openpi"
+Upstream = "https://github.com/Physical-Intelligence/openpi"
 
 [dependency-groups]
 dev = [
@@ -74,7 +75,6 @@ override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
-libero = { path = "third_party/libero/LIBERO", editable = true }
 
 [tool.uv.workspace]
 members = ["packages/*"]
@@ -136,6 +136,9 @@ force-single-line = true
 force-sort-within-sections = true
 single-line-exclusions = ["collections.abc", "typing", "typing_extensions"]
 known-third-party = ["wandb"]
+
+[tool.ruff.lint.per-file-ignores]
+"*_test.py" = ["RUF100", "SLF001"]
 
 [build-system]
 requires = ["hatchling"]

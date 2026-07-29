@@ -40,6 +40,7 @@ def main() -> None:
         )
 
     os.environ["LIBERO_CONFIG_PATH"] = str(_write_config())
+    os.environ["OPENPI_LIBERO_ROOT"] = str(LIBERO_PLUS_ROOT)
     sys.path.insert(0, str(LIBERO_PLUS_ROOT))
 
     # LIBERO-plus init-state files contain trusted NumPy arrays. PyTorch 2.6 changed

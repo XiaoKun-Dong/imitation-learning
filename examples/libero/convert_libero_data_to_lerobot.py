@@ -5,46 +5,54 @@ We use the Libero dataset (stored in RLDS) for this example, but it can be easil
 modified for any other data you have saved in a custom format.
 
 Usage:
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/data
+uv run python examples/libero/convert_libero_data_to_lerobot.py --data-dir /path/to/your/data
 
 If you want to push your dataset to the Hugging Face Hub, you can use the following command:
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/data --push_to_hub
+uv run python examples/libero/convert_libero_data_to_lerobot.py --data-dir /path/to/your/data --push-to-hub
 
 Note: to run the script, you need to install tensorflow_datasets:
 `uv pip install tensorflow tensorflow_datasets`
 
 You can download the raw Libero datasets from https://huggingface.co/datasets/openvla/modified_libero_rlds
-The resulting dataset will get saved to the $HF_LEROBOT_HOME directory.
+The default output matches the DemoVLA training configs:
+``data/lerobot/local/libero`` with repo id ``local/libero``.
 Running this conversion script will take approximately 30 minutes.
 """
 
+import pathlib
 import shutil
 
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import tensorflow_datasets as tfds
 import tyro
 
-REPO_NAME = "your_hf_username/libero"  # Name of the output dataset, also used for the Hugging Face Hub
+DEFAULT_REPO_ID = "local/libero"
+DEFAULT_OUTPUT_ROOT = "data/lerobot/local/libero"
 RAW_DATASET_NAMES = [
-  ##  "libero_10_no_noops",
-  ##  "libero_goal_no_noops",
     "libero_object_no_noops",
-  ##  "libero_spatial_no_noops",
-]  # For simplicity we will combine multiple Libero datasets into one training dataset
+]
 
 
-def main(data_dir: str, *, push_to_hub: bool = False):
-    # Clean up any existing dataset in the output directory
-    output_path = HF_LEROBOT_HOME / REPO_NAME
+def main(
+    data_dir: str,
+    *,
+    output_root: str = DEFAULT_OUTPUT_ROOT,
+    repo_id: str = DEFAULT_REPO_ID,
+    overwrite: bool = False,
+    push_to_hub: bool = False,
+):
+    output_path = pathlib.Path(output_root).expanduser().resolve()
     if output_path.exists():
+        if not overwrite:
+            raise FileExistsError(f"Output already exists: {output_path}. Pass --overwrite to replace it.")
         shutil.rmtree(output_path)
 
     # Create LeRobot dataset, define features to store
     # OpenPi assumes that proprio is stored in `state` and actions in `action`
     # LeRobot assumes that dtype of image data is `image`
     dataset = LeRobotDataset.create(
-        repo_id=REPO_NAME,
+        repo_id=repo_id,
+        root=output_path,
         robot_type="panda",
         fps=10,
         features={

@@ -1,53 +1,26 @@
-# π0.5 2D Object-Centric LIBERO
+# DemoVLA on OpenPI
 
-本项目基于 [Physical Intelligence OpenPI](https://github.com/Physical-Intelligence/openpi)，研究如何在不修改
-π0.5 图像/语言主干的前提下，为 action expert 增加显式目标物条件，并验证它在目标位移、干扰物增加等
-场景中的鲁棒性。
+本仓库基于 [Physical Intelligence OpenPI](https://github.com/Physical-Intelligence/openpi)，当前主线是在
+π0.5 LIBERO policy 上加入可解释的 interaction memory：
 
-当前主线是 **2D object-centric**：使用 simulator 提供的目标实例分割，构造
-`target_mask + target_bbox + target_crop`，编码为空间 object token，再由 action expert token 通过
-cross-attention 读取。Point cloud 暂未引入；已有 `target_point` 单点 3D 路线仅保留为附加对照。
+- 从 base RGB 和 wrist RGB 的视觉 patch 中提取 4 个 interaction tokens；
+- 在 action expert 的多个深度层进行 gated residual injection；
+- 使用 attention diversity 和 memory diversity 抑制 query collapse；
+- 支持按 episode/replan 保存带位置的 patch attention 可视化；
+- 使用固定的 episode/replan flow noise 做可复现 rollout 对照。
 
-> 当前 mask 来自 LIBERO 的 GT instance segmentation，因此实验首先衡量 oracle 2D object condition 的价值，
-> 不代表真实分割模型存在误检、漏检和延迟时的最终性能。
+mask、bbox、crop 和 point 条件已经退出当前主线，只保留历史代码与实验记录。
 
-## 方法概览
+## 运行要求
 
-```text
-RGB + wrist RGB + language + proprioception
-                    |
-                    v
-             π0.5 frozen backbone
+推荐环境：
 
-target mask + bbox + masked RGB crop
-                    |
-                    v
-          16x16 object patch tokens
-                    |
-                    v
-action expert tokens -- cross-attention --> conditioned action tokens
-                    |
-                    v
-              flow-matching actions
-```
-
-当前 2D 配置具有以下约束：
-
-- 从官方 `pi05_libero` checkpoint 初始化。
-- 冻结所有 legacy policy 参数，只训练 `object_condition_*`。
-- cross-attention output projection 使用 zero initialization。
-- object residual scale 固定为 `0.1`。
-- 训练和推理均不向 2D 模型传入 depth 或 `target_point`。
-- 训练时 base RGB、target mask、masked crop 和 bbox 共享同一组 RandomCrop/Rotate 参数，避免空间错位。
-
-## 环境要求
-
-- Linux；当前开发环境为 Ubuntu 20.04/22.04。
-- Python 3.11。
-- NVIDIA GPU。π0.5 推理通常需要至少 8GB 显存；本项目的 adapter-only 单卡训练使用
-  `batch_size=1` 且关闭 EMA。
-- NVIDIA driver 可被 `nvidia-smi` 正常识别。JAX CUDA 运行库由 `uv` 环境安装，通常不需要单独安装系统 CUDA toolkit。
-- Git、Git LFS、curl、unzip、ffmpeg 和 ImageMagick/MagickWand。
+- Ubuntu 20.04 或 22.04，x86_64；
+- Python 3.11（仓库通过 `.python-version` 固定）；
+- `uv` 和 Git；
+- NVIDIA GPU、支持 CUDA 12 的驱动；训练前应能正常运行 `nvidia-smi`；
+- 至少 16 GB 内存；完整训练、数据和多个 checkpoint 建议准备充足磁盘空间；
+- headless LIBERO 评估需要 EGL。
 
 Ubuntu 系统依赖：
 
@@ -55,357 +28,321 @@ Ubuntu 系统依赖：
 sudo apt-get update
 sudo apt-get install -y \
   git git-lfs curl unzip ffmpeg \
-  libgl1 libglib2.0-0 libmagickwand-dev
+  libgl1 libegl1 libglib2.0-0
+git lfs install
 ```
 
-安装 [uv](https://docs.astral.sh/uv/getting-started/installation/) 后初始化仓库：
+安装 `uv`：
 
 ```bash
-git submodule update --init --recursive
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-验证基础环境：
+如果安装目录尚未进入 PATH，可重新打开终端或执行 `uv tool update-shell`。
+
+## Clone 后快速开始
 
 ```bash
-uv run python -c "import jax; print(jax.devices())"
-uv run python -c "from libero.libero import get_libero_path; print(get_libero_path('datasets'))"
-uv run python -c "from wand.api import library; print('MagickWand OK')"
+git clone --recurse-submodules <your-repository-url>
+cd openpi
+bash scripts/setup_demovla.sh
 ```
 
-如果 Codex/容器环境无法写入默认 uv cache，可临时使用：
+如果需要从 RLDS/TFRecord 转换训练数据，安装额外的 TensorFlow/TFDS 依赖：
 
 ```bash
-export UV_CACHE_DIR=/tmp/uv-cache
-export XDG_CACHE_HOME=/tmp/xdg-cache
-```
-
-## 目录结构
-
-```text
-src/openpi/models/pi0.py                 object encoder 与 cross-attention
-src/openpi/models/model.py               Observation 与 object 字段预处理
-src/openpi/training/config.py            数据和训练配置
-src/openpi/policies/libero_policy.py      LIBERO policy 输入输出映射
-examples/libero/main.py                   LIBERO/LIBERO-P 在线评测
-examples/libero/run_libero_plus.py        隔离加载 LIBERO-P
-examples/libero/convert_libero_data_to_lerobot.py
-                                         HDF5 -> LeRobot + object condition
-docs/pi05_object_mask_todo.md             实验记录与后续计划
-```
-
-## Checkpoint 准备
-
-当前配置默认使用：
-
-```text
-/home/dongxiaokun/baseck/pi05_libero/
-├── params/
-└── assets/
-```
-
-官方 checkpoint 地址：
-
-```text
-gs://openpi-assets/checkpoints/pi05_libero
-```
-
-也可以让 OpenPI 直接读取 GCS 路径，或者将 checkpoint 下载到本地后修改
-[`src/openpi/training/config.py`](src/openpi/training/config.py) 中的 `assets_dir` 和 `CheckpointWeightLoader`。
-
-注意 checkpoint 层级：
-
-- policy server 的 `--policy.dir` 指向包含 `params/` 和 `assets/` 的 checkpoint 根目录。
-- `CheckpointWeightLoader` 指向具体的 `params/` 目录。
-- Orbax 目录中应存在 `_METADATA`；若缺失，通常是路径多一层或少一层。
-
-## LIBERO 训练数据
-
-原始 LIBERO Object demonstrations 默认放置在：
-
-```text
-third_party/libero/LIBERO/libero/datasets/libero_object/*_demo.hdf5
-```
-
-转换为带 2D/单点 3D 标注的本地 LeRobot 数据集：
-
-```bash
-uv run python examples/libero/convert_libero_data_to_lerobot.py \
-  --repo-name local/libero_object_mask \
-  --output-root data/lerobot \
-  --debug-overlay-dir data/libero_mask_debug_full \
-  --debug-frames-per-task 3
-```
-
-输出位置：
-
-```text
-data/lerobot/local/libero_object_mask
-```
-
-当前完整数据包含：
-
-- 500 episodes
-- 74,507 frames
-- 10 个 LIBERO Object 任务
-- 每帧 `target_mask`、`target_bbox`、`target_crop` 和 `target_point`
-
-2D 训练配置只 repack 前三个字段，即使数据文件包含 `target_point` 也不会传入模型。
-
-## 训练
-
-当前主配置：
-
-```text
-pi05_libero_object_2d_cross_attention
-```
-
-它复用官方 `pi05_libero` norm stats，因此使用当前数据和机器人动作定义时不需要重新计算。如果数据或动作空间发生变化，
-再运行：
-
-```bash
-uv run python scripts/compute_norm_stats.py \
-  --config-name pi05_libero_object_2d_cross_attention
-```
-
-单卡 1k-step pilot：
-
-```bash
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
-uv run python scripts/train.py pi05_libero_object_2d_cross_attention \
-  --exp-name 2d_pilot_1k \
-  --batch-size 1 \
-  --num-workers 4 \
-  --num-train-steps 1000 \
-  --save-interval 250 \
-  --ema-decay None \
-  --no-wandb-enabled \
-  --overwrite
-```
-
-checkpoint 将写入：
-
-```text
-checkpoints/pi05_libero_object_2d_cross_attention/2d_pilot_1k/{250,500,750,999}
-```
-
-显存不足时优先保持 `batch-size=1`、`ema-decay=None`，并减少 `num-workers`。adapter-only 训练不应通过
-解冻 backbone 来换取短期 loss 下降，否则难以与官方成熟策略公平比较。
-
-## 启动 Policy Server
-
-### 2D object-centric
-
-```bash
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
-uv run python scripts/serve_policy.py \
-  policy:checkpoint \
-  --policy.config pi05_libero_object_2d_cross_attention \
-  --policy.dir checkpoints/pi05_libero_object_2d_cross_attention/2d_pilot_1k/999
-```
-
-### 官方 π0.5 LIBERO baseline
-
-```bash
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
-uv run python scripts/serve_policy.py \
-  policy:checkpoint \
-  --policy.config pi05_libero \
-  --policy.dir /home/dongxiaokun/baseck/pi05_libero
-```
-
-服务默认监听：
-
-```text
-ws://0.0.0.0:8000
-```
-
-同一时间只启动一个占用 8000 端口的 server。
-
-## LIBERO-P 配置
-
-LIBERO-P 用于测试目标位移、干扰物、相机、光照等分布扰动。它在独立 Python 路径中加载，不替换训练使用的
-原始 LIBERO package。
-
-首次安装：
-
-```bash
-bash examples/libero/setup_libero_plus.sh
+bash scripts/setup_demovla.sh --with-rlds
 ```
 
 脚本会：
 
-- clone `sylvestf/LIBERO-plus`
-- 安装 `scikit-image` 和 `wand`
-- 检查系统 MagickWand
-- 断点续传约 6.4GB 的 `assets.zip`
-- 处理上游 zip 中异常的目录前缀并放置 assets
+1. 初始化 LIBERO 子模块；
+2. 使用 Python 3.11 和 `uv.lock` 创建 `.venv`；
+3. 安装训练、评估与开发依赖；
+4. 检查 JAX、PyTorch、LeRobot、MuJoCo、Robosuite 和 LIBERO。
 
-解压后的 assets 约占 9.5GB。确认评测可以启动后，可删除压缩包回收空间：
-
-```bash
-rm third_party/libero-plus/assets.zip
-```
-
-## 评测
-
-评测需要两个终端：终端 1 启动 policy server，终端 2 运行 simulator client。
-
-### 目标位移
-
-从 LIBERO-P `_level*` 中确定性打乱并抽取 20 个多目标任务：
+随时可以重新检查环境：
 
 ```bash
-MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 \
-uv run python examples/libero/run_libero_plus.py \
-  --args.task-suite-name libero_object \
-  --args.object-condition 2d \
-  --args.task-category "Objects Layout" \
-  --args.task-name-contains _level \
-  --args.shuffle-tasks \
-  --args.max-tasks 20 \
-  --args.num-trials-per-task 1 \
-  --args.seed 7 \
-  --args.video-out-path data/libero_plus/videos/target_displacement_2d_seed7
+uv run python scripts/check_demovla_env.py
 ```
 
-### 增加干扰物
+严格检查训练所需的 GPU、数据、norm stats 和本地 checkpoint：
 
 ```bash
-MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 \
-uv run python examples/libero/run_libero_plus.py \
-  --args.task-suite-name libero_object \
-  --args.object-condition 2d \
-  --args.task-category "Objects Layout" \
-  --args.task-name-contains _add_ \
-  --args.shuffle-tasks \
-  --args.max-tasks 20 \
-  --args.num-trials-per-task 1 \
-  --args.seed 7 \
-  --args.video-out-path data/libero_plus/videos/object_distractors_2d_seed7
+uv run python scripts/check_demovla_env.py \
+  --require-gpu \
+  --require-data \
+  --require-norm-stats \
+  --require-checkpoint
 ```
 
-评测 Base 时保持 task 过滤、seed、replan steps 和任务数完全一致，只修改：
+使用默认 GCS checkpoint 而不是本地副本时，省略 `--require-checkpoint`。
+
+## 本地路径配置
+
+配置不再写死开发者的 home 目录。默认值和可选环境变量如下：
+
+| 资源 | 默认值 | 环境变量 |
+|---|---|---|
+| LIBERO Object LeRobot 数据 | `data/lerobot/local/libero` | `OPENPI_LIBERO_DATA_ROOT` |
+| π0.5 LIBERO 初始化权重 | `gs://openpi-assets/checkpoints/pi05_libero` | `OPENPI_PI05_LIBERO_CHECKPOINT` |
+| π0.5 base 权重 | `gs://openpi-assets/checkpoints/pi05_base` | `OPENPI_PI05_BASE_CHECKPOINT` |
+| LIBERO checkout | 自动识别 `third_party/libero` 和旧的嵌套布局 | `OPENPI_LIBERO_ROOT` |
+
+使用本地 checkpoint 时：
 
 ```bash
---args.object-condition none
---args.video-out-path <新的输出目录>
+export OPENPI_PI05_LIBERO_CHECKPOINT=/absolute/path/to/pi05_libero
 ```
 
-建议至少运行 seed `7、42、123`。`seed` 同时控制任务打乱和 simulator 随机状态，因此 Base 与 2D 必须成对使用
-相同 seed。
-
-## Mask 在线更新
-
-mask 不是 episode 开始时固定一次。每当 action plan 执行完、client 请求新的 action chunk 时，评测器会：
-
-1. 从当前 observation 读取实时 instance segmentation。
-2. 根据目标实例生成 mask、bbox 和 masked RGB crop。
-3. 将当前 2D 条件发送给 policy server。
-4. 执行 `replan_steps` 个动作后再次更新。
-
-因此更新频率由 `--args.replan-steps` 控制，而不是每个 simulator step 都请求一次模型。
-
-## 指标与结果文件
-
-每次评测会在视频目录生成：
+该目录应包含：
 
 ```text
-metrics.jsonl
-rollout_task_XXXX_..._success.mp4
-rollout_task_XXXX_..._failure.mp4
+pi05_libero/
+├── params/
+│   └── _METADATA
+└── assets/
+    └── physical-intelligence/libero/norm_stats.json
 ```
 
-核心指标：
-
-- `success`：任务是否完成。
-- `target_grasped`：是否曾抓住目标物。
-- `wrong_object_grasped`：是否抓住非目标物。
-- `steps`：episode 执行步数。
-- `difficulty_level`：LIBERO-P 综合难度。
-
-目标位移强度由任务名中的 `level1` 至 `level5` 表示，不应与 JSON 的综合 `difficulty_level` 混用。
-
-主要实验应报告 success rate、target-grasp failure、post-grasp failure、wrong-object rate、共同成功任务步数，
-并使用严格配对的 task ID 和 seed。当前实验只能解释已见物体和已见技能下的扰动鲁棒性，不能宣称未见物体、
-新任务或新机器人上的通用泛化。
-
-## 测试
-
-运行 object-condition 相关测试：
+可以复制 `.env.example` 保存个人路径；`.env` 已被 git 忽略：
 
 ```bash
+cp .env.example .env
+# 编辑 .env 后
+set -a
+source .env
+set +a
+```
+
+## 准备 LIBERO Object 数据
+
+当前主配置使用官方 `openvla/modified_libero_rlds` 中的
+`libero_object_no_noops`，包含两路 256×256 RGB：
+
+- `image`：第三人称 agent view；
+- `wrist_image`：腕部视角。
+
+模型输入阶段会按官方 π0.5 流程统一缩放到 224×224。
+
+只下载 Object 子任务：
+
+```bash
+mkdir -p data/modified_libero_rlds
+env -u HF_ENDPOINT \
+uvx --from huggingface_hub hf download openvla/modified_libero_rlds \
+  --repo-type dataset \
+  --include "libero_object_no_noops/**" \
+  --local-dir data/modified_libero_rlds
+```
+
+如果所在网络需要 Hugging Face 镜像，请先确认该镜像完整包含 Object 的 32 个 TFRecord 分片。曾经设置
+`HF_ENDPOINT=https://hf-mirror.com` 时，可以对单条命令使用 `env -u HF_ENDPOINT` 强制访问官方端点。
+
+转换为本地 LeRobot v2.1 数据：
+
+```bash
+uv run python examples/libero/convert_libero_data_to_lerobot.py \
+  --data-dir data/modified_libero_rlds
+```
+
+默认输出：
+
+```text
+data/lerobot/local/libero
+```
+
+脚本默认拒绝覆盖已有目录。确认需要重建时显式增加 `--overwrite`。转换完成后检查：
+
+```bash
+uv run python scripts/check_demovla_env.py --require-data
+```
+
+当前 Object 数据的预期规模是 454 episodes、66,984 frames、10 tasks 和 454 个 Parquet 文件。
+
+## 计算 normalization statistics
+
+当前推荐训练配置：
+
+```text
+demovla_libero_sparse_deep_diverse
+```
+
+对新转换的数据计算 Object-only norm stats：
+
+```bash
+JAX_PLATFORMS=cpu \
+uv run python scripts/compute_norm_stats.py \
+  --config-name demovla_libero_sparse_deep_diverse
+```
+
+输出文件：
+
+```text
+assets/demovla_libero_sparse_deep_diverse/local/libero/norm_stats.json
+```
+
+训练配置会自动从这里读取 `state` 和 `actions` 统计。图像不参与 norm stats 计算。
+
+## 训练
+
+八卡训练示例：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
-uv run pytest -q src/openpi/models/model_test.py \
-  -k "object_condition or target or freeze_filter"
+uv run python scripts/train.py demovla_libero_sparse_deep_diverse \
+  --exp-name object_256_diverse_v1 \
+  --batch-size 128 \
+  --fsdp-devices 4
 ```
 
-代码检查：
+这里 `batch-size=128` 是 global batch size。8 张可见卡和 `fsdp-devices=4` 会形成两个 data-parallel
+group，每组使用 4 卡 FSDP。首次运行如果未设置本地 checkpoint 环境变量，会从 GCS 下载官方
+`pi05_libero` 权重。
+
+单卡 smoke test 可以降低 batch 和 worker：
 
 ```bash
-uv run ruff check src/openpi examples/libero
+CUDA_VISIBLE_DEVICES=0 \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+uv run python scripts/train.py demovla_libero_sparse_deep_diverse \
+  --exp-name smoke \
+  --batch-size 8 \
+  --num-workers 0 \
+  --num-train-steps 10 \
+  --save-interval 10 \
+  --no-wandb-enabled
 ```
+
+checkpoint 输出：
+
+```text
+checkpoints/demovla_libero_sparse_deep_diverse/<exp-name>/<step>
+```
+
+## 评估
+
+评估使用两个终端。
+
+终端 1：启动单卡 policy server：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+uv run python scripts/serve_policy.py \
+  policy:checkpoint \
+  --policy.config demovla_libero_sparse_deep_diverse \
+  --policy.dir checkpoints/demovla_libero_sparse_deep_diverse/<exp-name>/<step>
+```
+
+终端 2：运行 LIBERO Object rollout：
+
+```bash
+MUJOCO_GL=egl \
+MUJOCO_EGL_DEVICE_ID=0 \
+uv run python examples/libero/main.py \
+  --args.task-suite-name libero_object \
+  --args.object-condition none \
+  --args.num-trials-per-task 1 \
+  --args.seed 7 \
+  --args.policy-noise-seed 0 \
+  --args.video-out-path data/libero/videos/pilot
+```
+
+先用每任务 1 次的 pilot 排查运行问题，再把 `--args.num-trials-per-task` 提高到 50 做完整评估。正式对照应固定：
+
+- benchmark task 和 init state；
+- `seed`；
+- `policy-noise-seed`；
+- `replan-steps`；
+- diagnostics on/off 状态。
+
+评估器会自动识别标准子模块布局 `third_party/libero` 和旧布局
+`third_party/libero/LIBERO`，无需再手动 `uv pip install -e LIBERO` 或设置 `PYTHONPATH`。
+
+### Interaction patch 可视化
+
+启动 server 时增加：
+
+```bash
+--interaction-diagnostics
+```
+
+rollout 时增加：
+
+```bash
+--args.visualize-interaction-patches
+```
+
+每个 episode 的可视化保存在该 episode 对应的 `interaction_patches` 目录中。
 
 ## 常见问题
 
+### Hugging Face 下载报 `Distant resource does not seem to be on huggingface.co`
+
+检查：
+
+```bash
+echo "${HF_ENDPOINT:-unset}"
+```
+
+若指向不完整镜像，对下载命令使用：
+
+```bash
+env -u HF_ENDPOINT <hf-download-command>
+```
+
 ### `ModuleNotFoundError: No module named 'libero'`
 
-```bash
-git submodule update --init --recursive
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-uv pip install -e third_party/libero/LIBERO
-```
-
-### `MagickWand shared library not found`
+确认子模块存在：
 
 ```bash
-sudo apt-get install -y libmagickwand-dev
-uv run python -c "from wand.api import library; print('MagickWand OK')"
+git submodule update --init --recursive third_party/libero
+uv run python scripts/check_demovla_env.py
 ```
 
-### `torch.load` 报 `weights_only` 错误
-
-`examples/libero/run_libero_plus.py` 已为可信的 LIBERO-P init-state 文件设置兼容加载。请使用该 wrapper，
-不要直接运行 LIBERO-P 自带 evaluator。
+本项目的 evaluator 会直接加载 vendored checkout，不依赖 LIBERO 上游有问题的 editable package discovery。
 
 ### EGL 初始化失败
 
-先确认 `nvidia-smi` 正常，然后尝试：
+确认 `nvidia-smi` 正常，且 `MUJOCO_EGL_DEVICE_ID` 是当前进程可见 GPU 的索引。桌面环境可尝试：
 
 ```bash
-MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 <评测命令>
+MUJOCO_GL=glx uv run python examples/libero/main.py --help
 ```
 
-多卡机器需要把 `MUJOCO_EGL_DEVICE_ID` 改成实际可见设备序号。桌面环境也可以尝试 `MUJOCO_GL=glx`。
+### `FileNotFoundError: norm_stats.json`
 
-### `FileNotFoundError: _METADATA`
+为正在使用的训练配置重新运行 `scripts/compute_norm_stats.py`，并确认 `--config-name` 完全一致。
 
-检查 `--policy.dir` 与 `CheckpointWeightLoader` 的目录层级。policy 根目录通常包含 `params/`，而 loader 通常直接
-指向 `params/`。
-
-### 单卡训练显存不足
+### uv 缓存不可写
 
 ```bash
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
-uv run python scripts/train.py <config> \
-  --batch-size 1 \
-  --num-workers 0 \
-  --ema-decay None
+export UV_CACHE_DIR=/tmp/openpi-uv-cache
+export HF_DATASETS_CACHE=/tmp/openpi-hf-datasets
 ```
 
-## 实验路线
+### 显存不足
 
-当前优先级：
+先降低 global batch、关闭 EMA、减少 worker；多卡机器可调整 `--fsdp-devices`，该值必须整除可见设备数。
 
-1. 证明 2D object-centric 在目标位移或干扰物任务上的稳定优势。
-2. 确认原始 LIBERO Object 性能不被 residual 分支破坏。
-3. 完成 mask+bbox+crop、mask+bbox、crop-only 和 mask corruption 消融。
-4. 只有在明确 2D 表示的失败边界后，再恢复 point cloud 工作。
+## 开发检查
 
-详细状态与历史结果见 [docs/pi05_object_mask_todo.md](docs/pi05_object_mask_todo.md)。
+```bash
+uv run ruff check src/openpi scripts examples/libero
+uv run pytest -q src/openpi/models/demovla_test.py
+```
+
+## 文档
+
+- [DemoVLA 架构、训练与可视化](docs/demovla.md)
+- [Sparse-deep 训练报告](docs/demovla_sparse_deep_training_report.md)
+- [Diversity 10k 训练与评估报告](docs/demovla_sparse_deep_diversity_10k.md)
+- [历史 object-condition 实验](docs/pi05_object_mask_todo.md)
 
 ## 致谢与许可
 
-本项目建立在 OpenPI、LIBERO、LIBERO-P、JAX、Flax、LeRobot、MuJoCo 和 Robosuite 之上。上游模型与代码的
-版权和许可归各自作者所有；本仓库继续遵循根目录 [LICENSE](LICENSE) 中的许可条款。
+本项目建立在 OpenPI、LIBERO、LeRobot、MuJoCo、Robosuite、JAX、Flax 和 PyTorch 之上。上游模型、数据与代码
+遵循各自许可证；本仓库遵循根目录 [LICENSE](LICENSE)。

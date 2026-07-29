@@ -8,9 +8,6 @@ import random
 from typing import Literal
 
 import imageio
-from libero.libero import benchmark
-from libero.libero import get_libero_path
-from libero.libero.envs import SegmentationRenderEnv
 import numpy as np
 import object_condition as _object_condition
 from openpi_client import base_policy as _base_policy
@@ -23,6 +20,11 @@ import tqdm
 import tyro
 
 from openpi.models import demovla_visualization
+from openpi.shared import libero_runtime as _libero_runtime
+
+benchmark, get_libero_path, SegmentationRenderEnv = _libero_runtime.import_modules(
+    pathlib.Path(__file__).resolve().parents[2]
+)
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -44,7 +46,7 @@ class Args:
     task_suite_name: str = (
         "libero_object"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
-    object_condition: Literal["none", "2d", "2d_empty", "2d_wrong", "3d"] = "3d"
+    object_condition: Literal["none", "2d", "2d_empty", "2d_wrong", "3d"] = "none"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
     task_category: str | None = None  # LIBERO-plus perturbation category, e.g. "Objects Layout".

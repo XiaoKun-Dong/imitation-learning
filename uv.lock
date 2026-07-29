@@ -2163,11 +2163,6 @@ wheels = [
 ]
 
 [[package]]
-name = "libero"
-version = "0.1.0"
-source = { editable = "third_party/libero/LIBERO" }
-
-[[package]]
 name = "llvmlite"
 version = "0.44.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -3269,12 +3264,12 @@ dependencies = [
     { name = "fsspec", extra = ["gcs"] },
     { name = "gym" },
     { name = "gym-aloha" },
-    { name = "imageio" },
+    { name = "imageio", extra = ["ffmpeg"] },
     { name = "jax", extra = ["cuda12"] },
     { name = "jaxtyping" },
     { name = "lerobot" },
-    { name = "libero" },
     { name = "ml-collections" },
+    { name = "mujoco" },
     { name = "numpy" },
     { name = "numpydantic" },
     { name = "opencv-python" },
@@ -3282,6 +3277,7 @@ dependencies = [
     { name = "orbax-checkpoint" },
     { name = "pillow" },
     { name = "polars" },
+    { name = "pyyaml" },
     { name = "rich" },
     { name = "robosuite" },
     { name = "sentencepiece" },
@@ -3326,12 +3322,12 @@ requires-dist = [
     { name = "fsspec", extras = ["gcs"], specifier = ">=2024.6.0" },
     { name = "gym", specifier = "==0.25.2" },
     { name = "gym-aloha", specifier = ">=0.1.1" },
-    { name = "imageio", specifier = ">=2.36.1" },
+    { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.36.1" },
     { name = "jax", extras = ["cuda12"], specifier = "==0.5.3" },
     { name = "jaxtyping", specifier = "==0.2.36" },
     { name = "lerobot", git = "https://github.com/huggingface/lerobot?rev=0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" },
-    { name = "libero", editable = "third_party/libero/LIBERO" },
     { name = "ml-collections", specifier = "==1.0.0" },
+    { name = "mujoco", specifier = "==2.3.7" },
     { name = "numpy", specifier = ">=1.22.4,<2.0.0" },
     { name = "numpydantic", specifier = ">=1.6.6" },
     { name = "opencv-python", specifier = ">=4.10.0.84" },
@@ -3339,6 +3335,7 @@ requires-dist = [
     { name = "orbax-checkpoint", specifier = "==0.11.13" },
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "polars", specifier = ">=1.30.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "rich", specifier = ">=14.0.0" },
     { name = "robosuite", specifier = "==1.4.1" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
