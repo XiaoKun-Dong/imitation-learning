@@ -58,8 +58,11 @@ if command -v ldconfig >/dev/null 2>&1 && ! ldconfig -p 2>/dev/null | grep "libE
 fi
 
 if ((SKIP_SUBMODULES == 0)); then
+  if [[ -n "${OPENPI_LIBERO_REPO_URL:-}" ]]; then
+    git config submodule.third_party/libero.url "$OPENPI_LIBERO_REPO_URL"
+  fi
   if [[ ! -f third_party/libero/setup.py && ! -f third_party/libero/LIBERO/setup.py ]]; then
-    git submodule update --init --recursive third_party/libero
+    git submodule update --init third_party/libero
   fi
 fi
 

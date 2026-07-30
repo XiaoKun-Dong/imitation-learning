@@ -27,7 +27,7 @@ We follow this einsum axis naming convention:
 
 from collections.abc import Callable, Sequence
 import dataclasses
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import einops
 import flax.linen as nn
@@ -340,11 +340,16 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
+        layer_adapter_aux = None
         if layer_adapter is not None:
-            xs = layer_adapter(layer_index, xs)
+            adapter_output = layer_adapter(layer_index, xs)
+            if isinstance(adapter_output, tuple):
+                xs, layer_adapter_aux = adapter_output
+            else:
+                xs = adapter_output
             xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        return xs, (kv_cache, layer_adapter_aux)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -413,13 +418,14 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
         layer_adapter: Callable | None = None,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_layer_adapter_aux: bool = False,
+    ) -> Any:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(
+        embedded, (kv_cache, layer_adapter_aux) = self.layers(
             embedded,
             kv_cache,
             positions,
@@ -432,9 +438,12 @@ class Module(nn.Module):
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        outputs = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if return_layer_adapter_aux:
+            return outputs, kv_cache, layer_adapter_aux
+        return outputs, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

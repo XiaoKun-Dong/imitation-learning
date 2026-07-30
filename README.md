@@ -43,8 +43,15 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ## Clone 后快速开始
 
 ```bash
-git clone --recurse-submodules <your-repository-url>
+git clone <your-repository-url>
 cd openpi
+bash scripts/setup_demovla.sh
+```
+
+GitHub HTTPS 较慢而 SSH 可用时：
+
+```bash
+OPENPI_LIBERO_REPO_URL=git@github.com:Lifelong-Robot-Learning/LIBERO.git \
 bash scripts/setup_demovla.sh
 ```
 
@@ -56,7 +63,7 @@ bash scripts/setup_demovla.sh --with-rlds
 
 脚本会：
 
-1. 初始化 LIBERO 子模块；
+1. 只初始化 LIBERO 子模块，不下载 ALOHA；
 2. 使用 Python 3.11 和 `uv.lock` 创建 `.venv`；
 3. 安装训练、评估与开发依赖；
 4. 检查 JAX、PyTorch、LeRobot、MuJoCo、Robosuite 和 LIBERO。
@@ -299,11 +306,21 @@ env -u HF_ENDPOINT <hf-download-command>
 确认子模块存在：
 
 ```bash
-git submodule update --init --recursive third_party/libero
+git submodule update --init third_party/libero
 uv run python scripts/check_demovla_env.py
 ```
 
 本项目的 evaluator 会直接加载 vendored checkout，不依赖 LIBERO 上游有问题的 editable package discovery。
+
+### Clone 卡在 ALOHA 或 LIBERO
+
+不要使用 `git clone --recurse-submodules`。主仓库 clone 完成后，只拉取 LIBERO：
+
+```bash
+git config submodule.third_party/aloha.update none
+git config submodule.third_party/libero.url git@github.com:Lifelong-Robot-Learning/LIBERO.git
+git submodule update --init third_party/libero
+```
 
 ### EGL 初始化失败
 

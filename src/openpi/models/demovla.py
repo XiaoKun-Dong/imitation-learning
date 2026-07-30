@@ -25,6 +25,7 @@ from openpi.models import pi0_config
 from openpi.shared import array_typing as at
 
 _SIGLIP_PATCH_SIZE = 14
+_DYNAMIC_GATE_FLOW_BINS = 5
 
 
 def _linear(
@@ -78,8 +79,10 @@ def _pairwise_diversity_loss(
 
 def _apply_sparse_deep_adapter(
     num_heads,
+    gate_mode,
     params,
     interaction_memory,
+    flow_time_embedding,
     injection_layers,
     layer_index,
     hidden_groups,
@@ -109,12 +112,76 @@ def _apply_sparse_deep_adapter(
 
         matches = layer_index == injection_layers
         gate_index = jnp.argmax(matches)
-        gate = jax.nn.sigmoid(params["gates"][gate_index])
-        return (hidden + gate * delta).astype(hidden.dtype)
+        if gate_mode == "dynamic":
+            if hidden.shape[-2] != params["slot_embeddings"].shape[0]:
+                raise ValueError(
+                    "dynamic gate action-slot embeddings must match the action hidden sequence length: "
+                    f"{params['slot_embeddings'].shape[0]} != {hidden.shape[-2]}"
+                )
+            normalized_hidden = _layer_norm(
+                hidden,
+                params["gate_norm_scale"],
+                params["gate_norm_bias"],
+            )
+            slot_embedding = jnp.broadcast_to(
+                params["slot_embeddings"][None, :, :],
+                (*hidden.shape[:2], params["slot_embeddings"].shape[-1]),
+            )
+            layer_embedding = jnp.broadcast_to(
+                params["layer_embeddings"][gate_index][None, None, :],
+                (*hidden.shape[:2], params["layer_embeddings"].shape[-1]),
+            )
+            expanded_flow_time = jnp.broadcast_to(
+                flow_time_embedding[:, None, :],
+                (*hidden.shape[:2], flow_time_embedding.shape[-1]),
+            )
+            gate_input = jnp.concatenate(
+                [normalized_hidden, slot_embedding, expanded_flow_time, layer_embedding],
+                axis=-1,
+            )
+            gate_hidden = jax.nn.silu(
+                _linear(gate_input, params["gate_mlp_in_kernel"], params["gate_mlp_in_bias"])
+            )
+            raw_gate = _linear(
+                gate_hidden,
+                params["gate_mlp_out_kernel"],
+                params["gate_mlp_out_bias"],
+            )[..., 0]
+        else:
+            raw_gate = jnp.broadcast_to(params["gates"][gate_index], hidden.shape[:2])
+
+        gate = jax.nn.sigmoid(raw_gate).astype(delta.dtype)
+        gated_delta = gate[..., None] * delta
+        injection_ratio = jnp.linalg.norm(gated_delta.astype(jnp.float32), axis=-1) / jnp.maximum(
+            jnp.linalg.norm(hidden.astype(jnp.float32), axis=-1),
+            1.0e-6,
+        )
+        attention_entropy = -jnp.mean(
+            jnp.sum(weights.astype(jnp.float32) * jnp.log(jnp.maximum(weights.astype(jnp.float32), 1.0e-8)), axis=-1),
+            axis=1,
+        )
+        aux = {
+            "attention_entropy": attention_entropy,
+            "gate": gate.astype(jnp.float32),
+            "injection_ratio": injection_ratio,
+            "raw_gate": raw_gate.astype(jnp.float32),
+        }
+        return (hidden + gated_delta).astype(hidden.dtype), aux
 
     matches = layer_index == injection_layers
-    action_hidden = jax.lax.cond(jnp.any(matches), inject, lambda hidden: hidden, action_hidden)
-    return [hidden_groups[0], action_hidden]
+    empty_aux = {
+        "attention_entropy": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
+        "gate": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
+        "injection_ratio": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
+        "raw_gate": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
+    }
+    action_hidden, aux = jax.lax.cond(
+        jnp.any(matches),
+        inject,
+        lambda hidden: (hidden, empty_aux),
+        action_hidden,
+    )
+    return [hidden_groups[0], action_hidden], aux
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,6 +197,9 @@ class DemoVLAConfig(pi0_config.Pi0Config):
     interaction_num_heads: int = 8
     interaction_mlp_ratio: int = 4
     interaction_gate_init: float = -4.0
+    interaction_gate_mode: Literal["scalar", "dynamic"] = "scalar"
+    interaction_dynamic_gate_hidden_dim: int = 256
+    interaction_dynamic_gate_embedding_dim: int = 64
     interaction_max_camera_views: int = 3
     interaction_injection_mode: Literal["single_shot", "sparse_deep"] = "sparse_deep"
     interaction_injection_layers: tuple[int, ...] = (4, 9, 14)
@@ -149,12 +219,20 @@ class DemoVLAConfig(pi0_config.Pi0Config):
             raise ValueError("interaction_num_heads must be positive")
         if self.interaction_mlp_ratio <= 0:
             raise ValueError("interaction_mlp_ratio must be positive")
+        if self.interaction_gate_mode not in ("scalar", "dynamic"):
+            raise ValueError(f"unsupported interaction_gate_mode: {self.interaction_gate_mode}")
+        if self.interaction_dynamic_gate_hidden_dim <= 0:
+            raise ValueError("interaction_dynamic_gate_hidden_dim must be positive")
+        if self.interaction_dynamic_gate_embedding_dim <= 0:
+            raise ValueError("interaction_dynamic_gate_embedding_dim must be positive")
         if self.interaction_max_camera_views <= 0:
             raise ValueError("interaction_max_camera_views must be positive")
         if self.interaction_injection_mode not in ("single_shot", "sparse_deep"):
             raise ValueError(f"unsupported interaction_injection_mode: {self.interaction_injection_mode}")
         if not self.interaction_adapter_share_weights:
             raise ValueError("DemoVLA currently requires shared interaction adapter weights")
+        if self.interaction_gate_mode == "dynamic" and self.interaction_injection_mode != "sparse_deep":
+            raise ValueError("dynamic gate requires sparse_deep interaction injection")
         if self.interaction_attention_diversity_weight < 0.0:
             raise ValueError("interaction_attention_diversity_weight must be non-negative")
         if self.interaction_memory_diversity_weight < 0.0:
@@ -208,6 +286,7 @@ class DemoVLA(pi0.Pi0):
         self.interaction_max_camera_views = config.interaction_max_camera_views
         self.interaction_injection_mode = config.interaction_injection_mode
         self.interaction_injection_layers = config.interaction_injection_layers
+        self.interaction_gate_mode = config.interaction_gate_mode
         self.interaction_attention_diversity_weight = config.interaction_attention_diversity_weight
         self.interaction_attention_diversity_margin = config.interaction_attention_diversity_margin
         self.interaction_memory_diversity_weight = config.interaction_memory_diversity_weight
@@ -262,12 +341,47 @@ class DemoVLA(pi0.Pi0):
             bias_init=nnx.initializers.zeros,
             rngs=rngs,
         )
-        num_gates = (
-            1 if config.interaction_injection_mode == "single_shot" else len(config.interaction_injection_layers)
-        )
-        self.demovla_interaction_gates = nnx.Param(
-            jnp.full((num_gates,), config.interaction_gate_init, dtype=jnp.float32)
-        )
+        if config.interaction_gate_mode == "dynamic":
+            gate_embedding_dim = config.interaction_dynamic_gate_embedding_dim
+            slot_key = rngs.params()
+            layer_key = rngs.params()
+            self.demovla_dynamic_gate_slot_embeddings = nnx.Param(
+                jax.random.normal(
+                    slot_key,
+                    (config.action_horizon, gate_embedding_dim),
+                    dtype=jnp.float32,
+                )
+                * 0.02
+            )
+            self.demovla_dynamic_gate_layer_embeddings = nnx.Param(
+                jax.random.normal(
+                    layer_key,
+                    (len(config.interaction_injection_layers), gate_embedding_dim),
+                    dtype=jnp.float32,
+                )
+                * 0.02
+            )
+            self.demovla_dynamic_gate_norm = nnx.LayerNorm(action_width, rngs=rngs)
+            gate_input_dim = 2 * action_width + 2 * gate_embedding_dim
+            self.demovla_dynamic_gate_mlp_in = nnx.Linear(
+                gate_input_dim,
+                config.interaction_dynamic_gate_hidden_dim,
+                rngs=rngs,
+            )
+            self.demovla_dynamic_gate_mlp_out = nnx.Linear(
+                config.interaction_dynamic_gate_hidden_dim,
+                1,
+                kernel_init=nnx.initializers.zeros,
+                bias_init=nnx.initializers.constant(config.interaction_gate_init),
+                rngs=rngs,
+            )
+        else:
+            num_gates = (
+                1 if config.interaction_injection_mode == "single_shot" else len(config.interaction_injection_layers)
+            )
+            self.demovla_interaction_gates = nnx.Param(
+                jnp.full((num_gates,), config.interaction_gate_init, dtype=jnp.float32)
+            )
 
     def _attention_with_weights(
         self,
@@ -464,6 +578,8 @@ class DemoVLA(pi0.Pi0):
         gate_index: int | at.Int[at.Array, ""] = 0,
     ) -> at.Float[at.Array, "b action_s action_d"]:
         """Let the current action hidden states retrieve cached interaction memory."""
+        if self.interaction_gate_mode != "scalar":
+            raise ValueError("inject_interaction_memory is only used by the scalar single-shot gate")
         query = self.demovla_action_query_proj(self.demovla_action_query_norm(action_tokens))
         delta = self._attention(
             query,
@@ -477,6 +593,7 @@ class DemoVLA(pi0.Pi0):
     def _make_sparse_deep_adapter(
         self,
         interaction_memory: at.Float[at.Array, "b interaction_s action_d"],
+        flow_time_embedding: at.Float[at.Array, "b action_d"],
     ):
         """Build the generic Gemma hook used only during the action-expert pass."""
         params = {
@@ -490,12 +607,31 @@ class DemoVLA(pi0.Pi0):
             "value_bias": self.demovla_memory_value_proj.bias.value,
             "output_kernel": self.demovla_action_output_proj.kernel.value,
             "output_bias": self.demovla_action_output_proj.bias.value,
-            "gates": self.demovla_interaction_gates.value,
         }
+        if self.interaction_gate_mode == "dynamic":
+            params.update(
+                {
+                    "gate_norm_scale": self.demovla_dynamic_gate_norm.scale.value,
+                    "gate_norm_bias": self.demovla_dynamic_gate_norm.bias.value,
+                    "slot_embeddings": self.demovla_dynamic_gate_slot_embeddings.value,
+                    "layer_embeddings": self.demovla_dynamic_gate_layer_embeddings.value,
+                    "gate_mlp_in_kernel": self.demovla_dynamic_gate_mlp_in.kernel.value,
+                    "gate_mlp_in_bias": self.demovla_dynamic_gate_mlp_in.bias.value,
+                    "gate_mlp_out_kernel": self.demovla_dynamic_gate_mlp_out.kernel.value,
+                    "gate_mlp_out_bias": self.demovla_dynamic_gate_mlp_out.bias.value,
+                }
+            )
+        else:
+            params["gates"] = self.demovla_interaction_gates.value
         return jax.tree_util.Partial(
-            functools.partial(_apply_sparse_deep_adapter, self.interaction_num_heads),
+            functools.partial(
+                _apply_sparse_deep_adapter,
+                self.interaction_num_heads,
+                self.interaction_gate_mode,
+            ),
             params,
             interaction_memory,
+            flow_time_embedding,
             jnp.asarray(self.interaction_injection_layers, dtype=jnp.int32),
         )
 
@@ -538,7 +674,9 @@ class DemoVLA(pi0.Pi0):
         prefix_mask: at.Bool[at.Array, "b prefix_s"],
         kv_cache: _gemma.KVCache,
         interaction_memory: at.Float[at.Array, "b interaction_s action_d"],
-    ) -> at.Float[at.Array, "b suffix_s action_d"]:
+        *,
+        return_adapter_aux: bool = False,
+    ):
         suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
         full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
@@ -547,18 +685,32 @@ class DemoVLA(pi0.Pi0):
         positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
         layer_adapter = None
         if self.interaction_injection_mode == "sparse_deep":
-            layer_adapter = self._make_sparse_deep_adapter(interaction_memory)
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [None, suffix_tokens],
-            mask=full_attn_mask,
-            positions=positions,
-            kv_cache=kv_cache,
-            adarms_cond=[None, adarms_cond],
-            layer_adapter=layer_adapter,
-        )
+            if adarms_cond is None:
+                raise ValueError("sparse-deep dynamic injection requires the pi0.5 flow-time embedding")
+            layer_adapter = self._make_sparse_deep_adapter(interaction_memory, adarms_cond)
+        if return_adapter_aux:
+            (prefix_out, suffix_out), _, adapter_aux = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+                layer_adapter=layer_adapter,
+                return_layer_adapter_aux=True,
+            )
+        else:
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+                layer_adapter=layer_adapter,
+            )
+            adapter_aux = None
         assert prefix_out is None
         assert suffix_out is not None
-        return suffix_out
+        return suffix_out, adapter_aux
 
     @override
     def compute_loss(
@@ -600,7 +752,7 @@ class DemoVLA(pi0.Pi0):
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
             observation, x_t, time, interaction_memory
         )
-        suffix_out = self._forward_action_expert(
+        suffix_out, adapter_aux = self._forward_action_expert(
             suffix_tokens,
             suffix_mask,
             suffix_ar_mask,
@@ -609,6 +761,7 @@ class DemoVLA(pi0.Pi0):
             prefix_mask,
             kv_cache,
             interaction_memory,
+            return_adapter_aux=self.interaction_gate_mode == "dynamic",
         )
         velocity = self.action_out_proj(suffix_out[:, -self.action_horizon :])
         flow_loss = jnp.mean(jnp.square(velocity - u_t), axis=-1)
@@ -636,6 +789,64 @@ class DemoVLA(pi0.Pi0):
             "demovla_memory_pair_cosine_max": memory_pair_cosine_max,
             "demovla_diversity_regularization": diversity_regularization,
         }
+        if adapter_aux is not None:
+            injection_layer_indices = jnp.asarray(self.interaction_injection_layers, dtype=jnp.int32)
+            dynamic_aux = jax.tree.map(lambda value: value[injection_layer_indices], adapter_aux)
+            gates = dynamic_aux["gate"]
+            metrics.update(
+                {
+                    "demovla_dynamic_gate_mean": jnp.mean(gates),
+                    "demovla_dynamic_gate_std": jnp.std(gates),
+                    "demovla_dynamic_gate_raw_mean": jnp.mean(dynamic_aux["raw_gate"]),
+                    "demovla_dynamic_injection_ratio_mean": jnp.mean(dynamic_aux["injection_ratio"]),
+                    "demovla_dynamic_attention_entropy_mean": jnp.mean(dynamic_aux["attention_entropy"]),
+                    "demovla_dynamic_flow_time_mean": jnp.mean(time),
+                }
+            )
+            for layer_offset, layer in enumerate(self.interaction_injection_layers):
+                layer_gates = gates[layer_offset]
+                layer_injection_ratio = dynamic_aux["injection_ratio"][layer_offset]
+                layer_attention_entropy = dynamic_aux["attention_entropy"][layer_offset]
+                metrics[f"demovla_dynamic_gate_layer_{layer}_mean"] = jnp.mean(layer_gates)
+                metrics[f"demovla_dynamic_gate_layer_{layer}_std"] = jnp.std(layer_gates)
+                metrics[f"demovla_dynamic_injection_ratio_layer_{layer}_mean"] = jnp.mean(
+                    layer_injection_ratio
+                )
+                metrics[f"demovla_dynamic_attention_entropy_layer_{layer}_mean"] = jnp.mean(
+                    layer_attention_entropy
+                )
+                for slot in range(self.action_horizon):
+                    metrics[f"demovla_dynamic_gate_layer_{layer}_slot_{slot}_mean"] = jnp.mean(
+                        layer_gates[:, slot]
+                    )
+                for flow_bin in range(_DYNAMIC_GATE_FLOW_BINS):
+                    lower = flow_bin / _DYNAMIC_GATE_FLOW_BINS
+                    upper = (flow_bin + 1) / _DYNAMIC_GATE_FLOW_BINS
+                    flow_mask = (time >= lower) & (
+                        time <= upper if flow_bin == _DYNAMIC_GATE_FLOW_BINS - 1 else time < upper
+                    )
+                    flow_mask_float = flow_mask.astype(jnp.float32)
+                    sample_count = jnp.sum(flow_mask_float)
+                    safe_count = jnp.maximum(sample_count, 1.0)
+                    slot_gate_mean = jnp.sum(layer_gates * flow_mask_float[:, None], axis=0) / safe_count
+                    centered_gate = layer_gates - slot_gate_mean[None, :]
+                    slot_gate_std = jnp.sqrt(
+                        jnp.sum(jnp.square(centered_gate) * flow_mask_float[:, None], axis=0) / safe_count
+                    )
+                    metric_prefix = f"demovla_dynamic_layer_{layer}_flow_bin_{flow_bin}"
+                    metrics[f"{metric_prefix}_sample_count"] = sample_count
+                    metrics[f"{metric_prefix}_gate_mean"] = jnp.mean(slot_gate_mean)
+                    metrics[f"{metric_prefix}_gate_std"] = jnp.mean(slot_gate_std)
+                    metrics[f"{metric_prefix}_injection_ratio_mean"] = (
+                        jnp.sum(layer_injection_ratio * flow_mask_float[:, None])
+                        / (safe_count * self.action_horizon)
+                    )
+                    metrics[f"{metric_prefix}_attention_entropy_mean"] = (
+                        jnp.sum(layer_attention_entropy * flow_mask_float[:, None])
+                        / (safe_count * self.action_horizon)
+                    )
+                    for slot in range(self.action_horizon):
+                        metrics[f"{metric_prefix}_slot_{slot}_gate_mean"] = slot_gate_mean[slot]
         return total_loss, metrics
 
     @override
@@ -668,7 +879,7 @@ class DemoVLA(pi0.Pi0):
                 batch_time,
                 interaction_memory,
             )
-            suffix_out = self._forward_action_expert(
+            suffix_out, _ = self._forward_action_expert(
                 suffix_tokens,
                 suffix_mask,
                 suffix_ar_mask,

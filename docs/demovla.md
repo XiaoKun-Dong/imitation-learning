@@ -4,7 +4,7 @@
 
 - 工作名称：DemoVLA
 - 基础模型：OpenPI `pi0.5`
-- 当前阶段：Sparse-deep diversity 10k 已完成训练和 50-episode 正式评估，进入基线补齐、失败分析与消融
+- 当前阶段：Sparse-deep diversity 10k 已完成训练和 50-episode 正式评估；dynamic gate 已实现，待训练
 - 最新结果：[DemoVLA Sparse-Deep Diversity 10k 训练与评估报告](demovla_sparse_deep_diversity_10k.md)
 - 无 diversity 基线：[DemoVLA Sparse-Deep 30k 训练报告](demovla_sparse_deep_training_report.md)
 - 核心约束：
@@ -234,7 +234,7 @@ every-layer: 每层注入
 - action Q projection；
 - output projection。
 
-每层只保留独立 gate：
+scalar-gate 基线中每层只保留独立 gate：
 
 ```python
 interaction_layer_gates[layer_index]
@@ -248,12 +248,42 @@ interaction_layer_gates[layer_index]
 
 如果共享参数明显限制性能，再消融独立 Q projection 或独立 adapter。
 
-### 6.4 与 Flow Timestep 的边界
+### 6.4 Dynamic Gate
 
-DemoVLA 不对 `pi0.5` 的 flow timestep 路径做额外修改。原始 Action Expert
-仍通过 AdaRMS 接收 flow timestep；Interaction Token Extractor 不读取该值。
-因此同一次 replan 内的 interaction memory 固定，只有 action hidden states
-继续按照原始 `pi0.5` 机制随去噪过程变化。
+dynamic gate 保持 interaction cross-attention 不变，只把每层全局标量 gate
+替换为 layer-wise、action-slot-wise、flow-time-aware 的小型控制器：
+
+```text
+gate_input = concat(
+    LayerNorm(action_hidden),
+    action_slot_embedding,
+    pi0.5_flow_time_embedding,
+    injection_layer_embedding,
+)
+gate = sigmoid(Linear(SiLU(Linear(gate_input))))
+hidden = hidden + gate * interaction_delta
+```
+
+对于默认的 3 个注入层和 `action_horizon=10`，每层输出
+`[batch, 10, 1]`，而不是一个标量。interaction memory 仍在每个 replan
+只计算一次；动态变化只发生在 Action Expert 的读取和注入强度上。
+
+初始化继续满足 base-model no-op：
+
+```text
+interaction output projection kernel/bias = 0
+dynamic gate output kernel = 0
+dynamic gate output bias = -4
+```
+
+因此初始 gate 约为 `0.018`，且实际注入严格为零。
+
+### 6.5 与 Flow Timestep 的边界
+
+DemoVLA 不修改 `pi0.5` 原始 flow timestep 编码和 AdaRMS 路径。
+Interaction Token Extractor 仍不读取 flow timestep；dynamic gate 仅复用
+`embed_suffix()` 已经生成的 `adarms_cond`，让 Action Expert 对固定 interaction
+memory 的读取强度能够随去噪阶段变化。
 
 ## 7. Attention 方向
 
@@ -460,6 +490,7 @@ language-conditioned interaction queries
 spatial and camera-aware visual retrieval
 single-shot / sparse-deep injection
 shared adapter with per-layer gates
+optional layer/slot/flow-time-aware dynamic gate
 attention and memory diversity losses
 training auxiliary metrics
 replan-level interaction diagnostics
@@ -474,6 +505,9 @@ interaction_num_heads: int = 8
 interaction_injection_mode: Literal["single_shot", "sparse_deep"] = "sparse_deep"
 interaction_injection_layers: tuple[int, ...] = (4, 9, 14)
 interaction_gate_init: float = -4.0
+interaction_gate_mode: Literal["scalar", "dynamic"] = "scalar"
+interaction_dynamic_gate_hidden_dim: int = 256
+interaction_dynamic_gate_embedding_dim: int = 64
 interaction_adapter_share_weights: bool = True
 interaction_attention_diversity_weight: float = 0.0
 interaction_attention_diversity_margin: float = 0.5
@@ -489,8 +523,9 @@ interaction_memory_diversity_margin: float = 0.5
 layer_adapter: Callable | None
 ```
 
-DemoVLA 在指定层通过该 hook 更新 Action Expert token group。`gemma.py` 不依赖
-DemoVLA 模块，也不理解 interaction memory 的具体语义。
+DemoVLA 在指定层通过该 hook 更新 Action Expert token group，并可返回逐层
+adapter diagnostics。`gemma.py` 不依赖 DemoVLA 模块，也不理解 interaction
+memory 的具体语义。
 
 ### `scripts/train.py`
 
@@ -512,6 +547,8 @@ checkpoint 加载已有参数，并为新增的 `demovla_.*` 参数保留模型�
 - single-shot 和 sparse-deep 消融配置；
 - `demovla_libero_sparse_deep_diverse` 在 sparse-deep 基础上启用
   attention/memory diversity regularization。
+- `demovla_libero_sparse_deep_dynamic_gate` 在相同 diversity 设置上启用
+  dynamic gate，并复用相同数据的 norm stats。
 
 当前 diverse 配置使用：
 
@@ -535,6 +572,12 @@ uv run python scripts/train.py demovla_libero_sparse_deep_diverse \
 
 这里的 `batch_size=128` 是 global batch size。八张可见卡和
 `--fsdp-devices 4` 形成两个 data-parallel group，每组进行四卡 FSDP。
+
+dynamic gate 训练时将配置名替换为：
+
+```text
+demovla_libero_sparse_deep_dynamic_gate
+```
 
 ### 推理、诊断与可视化
 
@@ -753,7 +796,24 @@ rollout 成功率确认去塌缩没有迫使 query 转向无关背景。
   noise，并让 diagnostics on/off 共用标准 action sampler。
 - [ ] 扩展至每任务 10 次，并完成目标选择错误率与背景误关注率分析。
 
-### Phase 5：扩展评估、鲁棒性和论文级消融（下一阶段）
+### Phase 5：Dynamic Gate（实现完成，待训练）
+
+- [x] 保留 scalar gate 基线，新增独立 `interaction_gate_mode="dynamic"`。
+- [x] 将 action hidden、action-slot embedding、原始 pi0.5 flow-time embedding
+  和 injection-layer embedding 拼接后输入两层 Gate MLP。
+- [x] dynamic gate 输出形状为每层 `[batch, action_horizon, 1]`。
+- [x] 保持 output projection 和 Gate MLP 最后一层零 kernel 初始化，step 0
+  严格恢复 base pi0.5。
+- [x] 返回 layer-wise gate、injection ratio 和 interaction attention entropy。
+- [x] 将训练 flow time 分为 5 个区间，记录
+  `layer × flow-bin × action-slot` gate 均值，并将细粒度指标写入
+  JSONL/WandB。
+- [x] 新增 `demovla_libero_sparse_deep_dynamic_gate` adapter-only 配置。
+- [ ] 在新服务器完成 10k 训练。
+- [ ] 绘制 layer × flow-time × action-slot gate heatmap。
+- [ ] 使用相同 initial states 和固定逐 replan flow noise 对比 scalar gate。
+
+### Phase 6：扩展评估、鲁棒性和论文级消融
 
 - [ ] 将 diverse 10k 扩展到 100 episodes，与无 diversity 10k 完全对齐。
 - [ ] 若 3k checkpoint 可用，则与 10k 对比；补齐 single-shot、vanilla 和

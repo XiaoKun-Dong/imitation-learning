@@ -31,7 +31,7 @@ import openpi.training.weight_loaders as _weight_loaders
 
 _DEMOVLA_PARAMS_FILTER = nnx_utils.PathRegex("demovla_.*")
 _DEMOVLA_INJECTION_FILTER = nnx_utils.PathRegex(
-    r"demovla_(action_query_.*|memory_(key|value)_proj.*|action_output_proj.*|interaction_gates)"
+    r"demovla_(action_query_.*|memory_(key|value)_proj.*|action_output_proj.*|interaction_gates|dynamic_gate_.*)"
 )
 _DEMOVLA_EXTRACTOR_FILTER = nnx.All(_DEMOVLA_PARAMS_FILTER, nnx.Not(_DEMOVLA_INJECTION_FILTER))
 _DEMOVLA_OUTPUT_PROJ_FILTER = nnx_utils.PathRegex("demovla_action_output_proj/.*")
@@ -230,7 +230,7 @@ def train_step(
         "update_norm": optax.global_norm(updates),
         "param_norm": optax.global_norm(kernel_params),
     }
-    if hasattr(model, "demovla_interaction_gates"):
+    if hasattr(model, "demovla_action_output_proj"):
         info.update(
             {
                 "demovla_adapter_grad_norm": optax.global_norm(grads.filter(_DEMOVLA_PARAMS_FILTER)),
@@ -242,16 +242,17 @@ def train_step(
                 "demovla_output_proj_param_norm": optax.global_norm(new_params.filter(_DEMOVLA_OUTPUT_PROJ_FILTER)),
             }
         )
-        raw_gates = model.demovla_interaction_gates.value
-        gates = jax.nn.sigmoid(raw_gates)
-        info["demovla_gate_mean"] = jnp.mean(gates)
-        if model.interaction_injection_mode == "single_shot":
-            gate_labels = ("input",)
-        else:
-            gate_labels = tuple(f"layer_{layer}" for layer in model.interaction_injection_layers)
-        for label, raw_gate, gate in zip(gate_labels, raw_gates, gates, strict=True):
-            info[f"demovla_gate_{label}_raw"] = raw_gate
-            info[f"demovla_gate_{label}"] = gate
+        if hasattr(model, "demovla_interaction_gates"):
+            raw_gates = model.demovla_interaction_gates.value
+            gates = jax.nn.sigmoid(raw_gates)
+            info["demovla_gate_mean"] = jnp.mean(gates)
+            if model.interaction_injection_mode == "single_shot":
+                gate_labels = ("input",)
+            else:
+                gate_labels = tuple(f"layer_{layer}" for layer in model.interaction_injection_layers)
+            for label, raw_gate, gate in zip(gate_labels, raw_gates, gates, strict=True):
+                info[f"demovla_gate_{label}_raw"] = raw_gate
+                info[f"demovla_gate_{label}"] = gate
     if getattr(model, "object_condition_use_gate", False):
         raw_gate = model.object_condition_gate.value
         gate = jax.nn.sigmoid(raw_gate)
@@ -337,9 +338,15 @@ def main(config: _config.TrainConfig):
             # Optimization statistics are averaged over the interval. State-like
             # values should show the value at the current checkpoint boundary.
             for key, value in latest_info.items():
-                if key == "learning_rate" or key.endswith("_param_norm") or "_gate_" in key:
+                is_scalar_gate_state = key == "demovla_gate_mean" or key.startswith("demovla_gate_layer_")
+                if key == "learning_rate" or key.endswith("_param_norm") or is_scalar_gate_state:
                     reduced_info[key] = value
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            console_info = {
+                key: value
+                for key, value in reduced_info.items()
+                if "_flow_bin_" not in key and "_slot_" not in key
+            }
+            info_str = ", ".join(f"{k}={v:.4f}" for k, v in console_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             _append_metrics_jsonl(config.checkpoint_dir / "metrics.jsonl", step, reduced_info)

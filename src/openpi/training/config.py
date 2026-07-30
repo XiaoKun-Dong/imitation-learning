@@ -958,6 +958,47 @@ _CONFIGS = [
         keep_period=1_000,
     ),
     TrainConfig(
+        name="demovla_libero_sparse_deep_dynamic_gate",
+        model=demovla.DemoVLAConfig(
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="dynamic",
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="local/libero",
+            root=_DEMOVLA_LIBERO_DATA_ROOT,
+            assets=AssetsConfig(
+                assets_dir="assets/demovla_libero_sparse_deep_diverse",
+                asset_id="local/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
+            missing_regex=".*(lora|object_condition|demovla).*",
+        ),
+        freeze_filter=_freeze_all_except_demovla_filter(),
+        num_train_steps=30_000,
+        log_interval=1_000,
+        save_interval=1_000,
+        keep_period=1_000,
+    ),
+    TrainConfig(
         name="pi05_libero_object_mask",
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1

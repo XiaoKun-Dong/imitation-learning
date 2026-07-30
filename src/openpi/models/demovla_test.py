@@ -20,6 +20,12 @@ def demovla_model():
     return config, config.create(jax.random.key(1))
 
 
+@pytest.fixture(scope="module")
+def dynamic_demovla_model():
+    config = demovla.DemoVLAConfig(interaction_gate_mode="dynamic")
+    return config, config.create(jax.random.key(12))
+
+
 def test_demovla_config_rejects_invalid_attention_shape():
     with pytest.raises(ValueError, match="divisible"):
         demovla.DemoVLAConfig(interaction_num_heads=7)
@@ -37,6 +43,14 @@ def test_demovla_config_rejects_invalid_diversity_settings():
         demovla.DemoVLAConfig(interaction_attention_diversity_weight=-1.0)
     with pytest.raises(ValueError, match=r"must be in \[-1, 1\]"):
         demovla.DemoVLAConfig(interaction_memory_diversity_margin=1.1)
+
+
+def test_demovla_config_rejects_dynamic_gate_for_single_shot():
+    with pytest.raises(ValueError, match="requires sparse_deep"):
+        demovla.DemoVLAConfig(
+            interaction_injection_mode="single_shot",
+            interaction_gate_mode="dynamic",
+        )
 
 
 def test_pairwise_diversity_penalizes_collapsed_queries():
@@ -70,6 +84,7 @@ def test_demovla_inputs_do_not_require_oracle_object_condition():
         ("demovla_libero_single_shot", "single_shot"),
         ("demovla_libero_sparse_deep", "sparse_deep"),
         ("demovla_libero_sparse_deep_diverse", "sparse_deep"),
+        ("demovla_libero_sparse_deep_dynamic_gate", "sparse_deep"),
     ],
 )
 def test_demovla_training_configs_are_adapter_only(config_name, injection_mode):
@@ -88,6 +103,9 @@ def test_demovla_training_configs_are_adapter_only(config_name, injection_mode):
     if config_name.endswith("_diverse"):
         assert config.model.interaction_attention_diversity_weight == 1e-3
         assert config.model.interaction_memory_diversity_weight == 1e-4
+    if config_name.endswith("_dynamic_gate"):
+        assert config.model.interaction_gate_mode == "dynamic"
+        assert any("demovla_dynamic_gate_mlp_out" in path for path in trainable_paths)
 
 
 def test_demovla_shared_adapter_and_layer_gates_start_as_exact_noop(demovla_model):
@@ -121,15 +139,144 @@ def test_sparse_deep_adapter_only_updates_configured_layers():
     memory = jax.random.normal(jax.random.key(9), (1, 2, width))
     injection_layers = jnp.asarray((1, 3))
 
-    unchanged = demovla._apply_sparse_deep_adapter(  # noqa: SLF001
-        2, params, memory, injection_layers, jnp.asarray(0), [None, action_hidden]
-    )[1]
-    updated = demovla._apply_sparse_deep_adapter(  # noqa: SLF001
-        2, params, memory, injection_layers, jnp.asarray(1), [None, action_hidden]
-    )[1]
+    unchanged, _ = demovla._apply_sparse_deep_adapter(  # noqa: SLF001
+        2,
+        "scalar",
+        params,
+        memory,
+        jnp.zeros((1, width)),
+        injection_layers,
+        jnp.asarray(0),
+        [None, action_hidden],
+    )
+    updated, _ = demovla._apply_sparse_deep_adapter(  # noqa: SLF001
+        2,
+        "scalar",
+        params,
+        memory,
+        jnp.zeros((1, width)),
+        injection_layers,
+        jnp.asarray(1),
+        [None, action_hidden],
+    )
 
-    assert jnp.array_equal(unchanged, action_hidden)
-    assert not jnp.allclose(updated, action_hidden)
+    assert jnp.array_equal(unchanged[1], action_hidden)
+    assert not jnp.allclose(updated[1], action_hidden)
+
+
+def test_dynamic_gate_parameters_start_as_base_model_noop(dynamic_demovla_model):
+    config, model = dynamic_demovla_model
+    assert model.demovla_dynamic_gate_slot_embeddings.value.shape == (
+        config.action_horizon,
+        config.interaction_dynamic_gate_embedding_dim,
+    )
+    assert model.demovla_dynamic_gate_layer_embeddings.value.shape == (
+        len(config.interaction_injection_layers),
+        config.interaction_dynamic_gate_embedding_dim,
+    )
+    assert jnp.all(model.demovla_dynamic_gate_mlp_out.kernel.value == 0.0)
+    assert jnp.all(model.demovla_dynamic_gate_mlp_out.bias.value == config.interaction_gate_init)
+    assert jnp.all(model.demovla_action_output_proj.kernel.value == 0.0)
+    assert jnp.all(model.demovla_action_output_proj.bias.value == 0.0)
+
+    action_hidden = jax.random.normal(
+        jax.random.key(13),
+        (1, config.action_horizon, model.demovla_action_output_proj.out_features),
+    )
+    memory = jax.random.normal(
+        jax.random.key(14),
+        (1, config.num_interaction_tokens, model.demovla_action_output_proj.out_features),
+    )
+    adapter = model._make_sparse_deep_adapter(  # noqa: SLF001
+        memory,
+        jnp.ones((1, model.demovla_action_output_proj.out_features)),
+    )
+    (_, injected), aux = adapter(jnp.asarray(config.interaction_injection_layers[0]), [None, action_hidden])
+
+    assert jnp.array_equal(injected, action_hidden)
+    assert jnp.allclose(aux["gate"], jax.nn.sigmoid(config.interaction_gate_init))
+    assert jnp.all(aux["injection_ratio"] == 0.0)
+
+
+def test_dynamic_gate_loss_exports_layer_flow_bin_and_slot_metrics(dynamic_demovla_model):
+    config, model = dynamic_demovla_model
+    observation = config.fake_obs(batch_size=1)
+    actions = config.fake_act(batch_size=1)
+
+    loss, metrics = nnx.eval_shape(
+        lambda module: module.compute_loss_with_aux(jax.random.key(15), observation, actions),
+        model,
+    )
+
+    assert loss.shape == (1, config.action_horizon)
+    assert metrics["demovla_dynamic_gate_mean"].shape == ()
+    assert metrics["demovla_dynamic_injection_ratio_layer_9_mean"].shape == ()
+    assert metrics["demovla_dynamic_layer_4_flow_bin_0_slot_0_gate_mean"].shape == ()
+    assert metrics["demovla_dynamic_layer_14_flow_bin_4_slot_9_gate_mean"].shape == ()
+    assert metrics["demovla_dynamic_layer_14_flow_bin_4_sample_count"].shape == ()
+
+
+def test_dynamic_gate_has_layer_slot_and_flow_time_capacity():
+    width = 4
+    hidden_dim = 3
+    embedding_dim = 2
+    horizon = 3
+    params = {
+        "norm_scale": jnp.ones((width,)),
+        "norm_bias": jnp.zeros((width,)),
+        "query_kernel": jnp.eye(width),
+        "query_bias": jnp.zeros((width,)),
+        "key_kernel": jnp.eye(width),
+        "key_bias": jnp.zeros((width,)),
+        "value_kernel": jnp.eye(width),
+        "value_bias": jnp.zeros((width,)),
+        "output_kernel": jnp.eye(width),
+        "output_bias": jnp.zeros((width,)),
+        "gate_norm_scale": jnp.ones((width,)),
+        "gate_norm_bias": jnp.zeros((width,)),
+        "slot_embeddings": jnp.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]),
+        "layer_embeddings": jnp.asarray([[0.0, 0.0], [0.0, 1.0]]),
+        "gate_mlp_in_kernel": jnp.zeros((2 * width + 2 * embedding_dim, hidden_dim))
+        .at[width, 0]
+        .set(1.0)
+        .at[width + embedding_dim, 1]
+        .set(1.0)
+        .at[2 * width + embedding_dim, 2]
+        .set(1.0),
+        "gate_mlp_in_bias": jnp.zeros((hidden_dim,)),
+        "gate_mlp_out_kernel": jnp.ones((hidden_dim, 1)),
+        "gate_mlp_out_bias": jnp.full((1,), -4.0),
+    }
+    action_hidden = jnp.arange(horizon * width, dtype=jnp.float32).reshape(1, horizon, width) + 1.0
+    memory = jnp.ones((1, 2, width), dtype=jnp.float32)
+    injection_layers = jnp.asarray((1, 3))
+
+    (_, layer_1_hidden), layer_1_aux = demovla._apply_sparse_deep_adapter(  # noqa: SLF001
+        2,
+        "dynamic",
+        params,
+        memory,
+        jnp.zeros((1, width)),
+        injection_layers,
+        jnp.asarray(1),
+        [None, action_hidden],
+    )
+    (_, layer_3_hidden), layer_3_aux = demovla._apply_sparse_deep_adapter(  # noqa: SLF001
+        2,
+        "dynamic",
+        params,
+        memory,
+        jnp.ones((1, width)),
+        injection_layers,
+        jnp.asarray(3),
+        [None, action_hidden],
+    )
+
+    assert layer_1_aux["gate"].shape == (1, horizon)
+    assert layer_1_aux["injection_ratio"].shape == (1, horizon)
+    assert not jnp.allclose(layer_1_aux["gate"][:, 0], layer_1_aux["gate"][:, -1])
+    assert not jnp.allclose(layer_1_aux["gate"], layer_3_aux["gate"])
+    assert not jnp.allclose(layer_1_hidden, layer_3_hidden)
 
 
 def test_demovla_memory_has_expected_shape_and_is_finite(demovla_model):
