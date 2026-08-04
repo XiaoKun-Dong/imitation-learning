@@ -70,6 +70,18 @@ class Policy(BasePolicy):
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = dict(sample_kwargs or {})
         self._interaction_diagnostics = bool(self._sample_kwargs.pop("interaction_diagnostics", False))
+        interaction_ablation = self._sample_kwargs.pop("interaction_ablation", "normal")
+        interaction_layer_mean_gates = tuple(self._sample_kwargs.pop("interaction_layer_mean_gates", ()))
+        if interaction_ablation != "normal" or interaction_layer_mean_gates:
+            configure_ablation = getattr(model, "configure_interaction_inference_ablation", None)
+            if configure_ablation is None:
+                raise ValueError("interaction ablations require a DemoVLA model")
+            configure_ablation(interaction_ablation, interaction_layer_mean_gates)
+            logging.info(
+                "Configured DemoVLA interaction ablation: mode=%s layer_mean_gates=%s",
+                interaction_ablation,
+                interaction_layer_mean_gates,
+            )
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device

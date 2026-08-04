@@ -21,6 +21,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.kuavo_policy as kuavo_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.nnx_utils as nnx_utils
@@ -45,6 +46,11 @@ _PI05_LIBERO_CHECKPOINT = os.environ.get(
     "gs://openpi-assets/checkpoints/pi05_libero",
 )
 _DEMOVLA_LIBERO_DATA_ROOT = os.environ.get("OPENPI_LIBERO_DATA_ROOT", "data/lerobot/local/libero")
+_DEMOVLA_KUAVO_RIGHT_DATA_ROOT = os.environ.get(
+    "OPENPI_KUAVO_RIGHT_DATA_ROOT",
+    "/home/dongxiaokun/小件钢圈上料/lerobot",
+)
+_DEMOVLA_KUAVO_VIDEO_BACKEND = os.environ.get("OPENPI_KUAVO_VIDEO_BACKEND", "torchcodec")
 
 
 def _checkpoint_subdir(checkpoint_root: str, subdir: str) -> str:
@@ -107,6 +113,11 @@ class DataConfig:
     # Optional local LeRobot dataset root. If set, repo_id metadata is read from
     # this directory instead of the default Hugging Face cache.
     root: str | None = None
+    # Optional video decoder backend supported by newer LeRobot loaders.
+    video_backend: str | None = None
+    # Optional lightweight transforms used only while computing normalization
+    # statistics. When set, video decoding is skipped.
+    norm_stats_transforms: _transforms.Group | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -406,6 +417,63 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotKuavoRightDataConfig(DataConfigFactory):
+    """LeRobot v3 mapping for Kuavo 5W right arm and Leju claw."""
+
+    extra_delta_transform: bool = True
+    video_backend: str | None = "pyav"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "cam_h": "observation.images.head_cam_h",
+                        "cam_r": "observation.images.wrist_cam_r",
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[kuavo_policy.KuavoRightInputs(model_type=model_config.model_type)],
+            outputs=[kuavo_policy.KuavoRightOutputs()],
+        )
+        if self.extra_delta_transform:
+            # The rosbag stores absolute joint targets. Keep only the claw command absolute.
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        norm_stats_transforms = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                ),
+                *([_transforms.DeltaActions(_transforms.make_bool_mask(7, -1))] if self.extra_delta_transform else []),
+            ]
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=("action",),
+            video_backend=self.video_backend,
+            norm_stats_transforms=norm_stats_transforms,
         )
 
 
@@ -995,8 +1063,65 @@ _CONFIGS = [
         freeze_filter=_freeze_all_except_demovla_filter(),
         num_train_steps=30_000,
         log_interval=1_000,
-        save_interval=1_000,
+        save_interval=5_000,
         keep_period=1_000,
+    ),
+    TrainConfig(
+        name="demovla_kuavo_right_dynamic_gate",
+        model=demovla.DemoVLAConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_horizon=10,
+            discrete_state_input=True,
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="dynamic",
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+        ),
+        data=LeRobotKuavoRightDataConfig(
+            repo_id="local/kuavo_small_ring",
+            root=_DEMOVLA_KUAVO_RIGHT_DATA_ROOT,
+            assets=AssetsConfig(asset_id="kuavo_right"),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            video_backend=_DEMOVLA_KUAVO_VIDEO_BACKEND,
+        ),
+        batch_size=32,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _checkpoint_subdir(_PI05_BASE_CHECKPOINT, "params"),
+            missing_regex=".*(lora|demovla).*",
+        ),
+        # Match the official low-memory fine-tuning policy: freeze the dense
+        # language-model weights while training LoRA and all non-LLM modules,
+        # including action/time projections and DemoVLA.
+        freeze_filter=demovla.DemoVLAConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            discrete_state_input=True,
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        log_interval=1_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        policy_metadata={
+            "robot_type": "kuavo-5w",
+            "which_arm": "right",
+            "eef_type": "leju_claw",
+            "control_frequency_hz": 10,
+            "prompt": "Pick and Place",
+        },
     ),
     TrainConfig(
         name="pi05_libero_object_mask",

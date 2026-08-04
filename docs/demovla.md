@@ -4,7 +4,7 @@
 
 - 工作名称：DemoVLA
 - 基础模型：OpenPI `pi0.5`
-- 当前阶段：Sparse-deep diversity 10k 已完成训练和 50-episode 正式评估；dynamic gate 已实现，待训练
+- 当前阶段：Dynamic gate 30k 已完成训练、配对消融和 LIBERO Object 500-episode 正式评估；开始迁移至 Kuavo 真机数据
 - 最新结果：[DemoVLA Sparse-Deep Diversity 10k 训练与评估报告](demovla_sparse_deep_diversity_10k.md)
 - 无 diversity 基线：[DemoVLA Sparse-Deep 30k 训练报告](demovla_sparse_deep_training_report.md)
 - 核心约束：
@@ -22,6 +22,8 @@
 - Attention diversity loss 和 memory diversity loss，以及对应训练日志。
 - 以 replan 为时间单位的 query × camera patch attention 可视化。
 - Policy server、websocket diagnostics、LIBERO rollout、视频和 episode metrics 链路。
+- Dynamic gate 已训练到 29999 step，并通过固定 flow noise 的逐 episode 配对消融。
+- Dynamic gate 在官方口径 LIBERO Object 评估中取得 495/500，成功率 99.0%。
 - `demovla_libero_sparse_deep_diverse` adapter-only 训练到 10k。
 - 10-task、每任务 1 次、seed 7 的 `libero_object` pilot：9/10 成功，0 次目标
   抓取失败，0 次错物抓取，1 次 post-grasp failure。
@@ -31,7 +33,85 @@
   McNemar `p=1.0`；但当时没有逐 replan 固定 flow noise，需要按新确定性协议
   重跑后才能作为严格因果比较。
 
-### 1.2 尚未完成
+### 1.2 Dynamic Gate LIBERO 正式评估
+
+最终使用 checkpoint：
+
+```text
+demovla_libero_sparse_deep_dynamic_gate/dynamic_gate_v1/29999
+```
+
+评估遵循 OpenPI 官方 LIBERO Object rollout 设置：
+
+```text
+OffScreenRenderEnv
+environment render size = 256
+model input size = 224
+rotate agentview and wrist images by 180 degrees
+wait steps = 10
+replan steps = 5
+trials per task = 50
+object condition = none
+interaction diagnostics = off
+flow noise = stateful policy RNG
+```
+
+在 10 个任务、每任务 50 次、共 500 episodes 上：
+
+| 任务 | 成功数 | 成功率 | 失败 episode |
+|---|---:|---:|---|
+| Alphabet soup | 47/50 | 94.0% | 1, 27, 34 |
+| Cream cheese | 50/50 | 100.0% | - |
+| Salad dressing | 50/50 | 100.0% | - |
+| BBQ sauce | 50/50 | 100.0% | - |
+| Ketchup | 49/50 | 98.0% | 48 |
+| Tomato sauce | 49/50 | 98.0% | 6 |
+| Butter | 50/50 | 100.0% | - |
+| Milk | 50/50 | 100.0% | - |
+| Chocolate pudding | 50/50 | 100.0% | - |
+| Orange juice | 50/50 | 100.0% | - |
+| **总计** | **495/500** | **99.0%** | **5** |
+
+成功 episode 的平均完成步数为 `149.4`，中位数为 `145`，范围为
+`118～273`。5 个失败 episode 均运行到 `290` step 上限，没有评测脚本提前
+异常。总体成功率的 Wilson 95% CI 为 `97.68%～99.57%`。官方公开的
+`pi0.5 @ 30k` LIBERO Object 结果为 98.2%；当前差异不足以宣称显著提升，
+但可以确认 dynamic gate 没有造成 rollout 性能退化。
+
+大规模评估前完成了两阶段退化检查：
+
+1. 固定逐 replan flow noise 的 30-episode 配对：dynamic 与官方 pi0.5 均为
+   `29/30`，逐 episode 结果完全相同，McNemar `p=1`。
+2. 官方 stateful RNG 的 100-episode dynamic-only 评估：`98/100`；仅 tomato
+   sauce 的 episode 4、6 失败。
+
+同一个 dynamic checkpoint 的固定-noise 注入消融结果为：
+
+```text
+dynamic       29/30  96.67%
+injection_off 13/30  43.33%
+pi05_official 29/30  96.67%
+```
+
+`injection_off` 相对官方参考的配对差异显著，McNemar `p=0.000145`。该结果
+说明当前 checkpoint 已依赖 interaction injection；同时，关闭注入后仍使用
+该 checkpoint 的本地 LIBERO Object norm stats，不能将其低成功率解释为官方 pi0.5
+backbone 本身退化。
+
+此前 gate 机制消融的 10-episode pilot 为：
+
+```text
+dynamic      10/10
+layer_mean   10/10
+injection_off 3/10
+static_deep   0/10
+```
+
+因此正式结果证明的是完整 dynamic-gate DemoVLA 有效且不退化；由于
+`dynamic` 与 `layer_mean` 在小样本中均触及天花板，尚不能单独证明动态门优于
+逐层平均固定门。
+
+### 1.3 尚未完成
 
 - 将 diverse 10k 扩展至每任务 10 次，缩小置信区间。
 - 若保留 3k checkpoint，则完成 3k/10k 对比；同时补齐 single-shot、vanilla
@@ -413,22 +493,21 @@ Extractor。新观测只在下一次 replan 时重新编码。
 
 ### 9.1 确定性 Rollout Noise
 
-LIBERO 评估默认不再依赖 policy server 中跨请求累积的 RNG。每次 replan 使用
-以下稳定标识生成显式 Gaussian flow noise：
+配对消融可以让每次 replan 使用以下稳定标识生成显式 Gaussian flow noise：
 
 ```text
 (policy_noise_seed, benchmark_task_id, episode_idx, replan_idx)
 ```
 
-默认：
+显式启用时：
 
 ```text
 policy_noise_seed = 0
 ```
 
 相同 checkpoint、observation 和四元组会获得逐元素一致的 noise；episode
-执行长短不会改变后续 episode 的 noise 序列。设为 `None` 可以恢复旧的
-stateful server RNG：
+执行长短不会改变后续 episode 的 noise 序列。官方性能评估默认不传该参数，
+使用 `None` 和 policy server 的 stateful RNG：
 
 ```bash
 --args.policy-noise-seed None
@@ -796,7 +875,7 @@ rollout 成功率确认去塌缩没有迫使 query 转向无关背景。
   noise，并让 diagnostics on/off 共用标准 action sampler。
 - [ ] 扩展至每任务 10 次，并完成目标选择错误率与背景误关注率分析。
 
-### Phase 5：Dynamic Gate（实现完成，待训练）
+### Phase 5：Dynamic Gate（训练与正式评估已完成）
 
 - [x] 保留 scalar gate 基线，新增独立 `interaction_gate_mode="dynamic"`。
 - [x] 将 action hidden、action-slot embedding、原始 pi0.5 flow-time embedding
@@ -809,9 +888,12 @@ rollout 成功率确认去塌缩没有迫使 query 转向无关背景。
   `layer × flow-bin × action-slot` gate 均值，并将细粒度指标写入
   JSONL/WandB。
 - [x] 新增 `demovla_libero_sparse_deep_dynamic_gate` adapter-only 配置。
-- [ ] 在新服务器完成 10k 训练。
+- [x] 完成 29999-step dynamic gate 训练。
+- [x] 完成 30-episode 官方 pi0.5 / dynamic / injection-off 固定-noise 配对检查。
+- [x] 完成官方 stateful RNG 的 100-episode 中等规模检查：98/100。
+- [x] 完成 LIBERO Object 每任务 50 次正式评估：495/500，成功率 99.0%。
 - [ ] 绘制 layer × flow-time × action-slot gate heatmap。
-- [ ] 使用相同 initial states 和固定逐 replan flow noise 对比 scalar gate。
+- [ ] 在失败更集中的任务上扩大 dynamic / layer-mean 固定-noise 配对消融。
 
 ### Phase 6：扩展评估、鲁棒性和论文级消融
 
@@ -825,6 +907,55 @@ rollout 成功率确认去塌缩没有迫使 query 转向无关背景。
 - [ ] 增加 distractor、位置、背景、相机、遮挡和光照鲁棒性评估。
 - [ ] 与 ACoT-style pooling 对齐参数和训练预算。
 - [ ] 汇总成功率置信区间、计算成本、grounding 和失败案例。
+
+### Phase 7：Kuavo 真机迁移（进行中）
+
+- [x] 确认第一版数据为 Kuavo 5W、右臂、Leju claw、10 Hz。
+- [x] 确认数据包含 111 episodes、101390 frames、8 维 state/action、头部与右腕相机。
+- [x] 确认采集 prompt 为 `Pick and Place`；第一版保持不变。
+- [x] 增加 LeRobot v3 本地数据兼容读取。
+- [x] 增加 Kuavo 右臂输入输出 transform 和独立 norm stats 配置。
+- [x] 增加从 pi0.5 base 初始化、联合训练 LoRA 与 DemoVLA dynamic gate 的配置。
+- [x] 使用全部 101390 帧计算 `kuavo_right` norm stats。
+- [ ] 启动第一版 30k 训练。
+- [ ] 完成 action chunk 离线回放、关节范围检查和真机低速安全测试。
+
+第一版保持数据集中的原始指令 `Pick and Place`，使用以下环境变量：
+
+```bash
+export OPENPI_KUAVO_RIGHT_DATA_ROOT=/home/dongxiaokun/小件钢圈上料/lerobot
+export OPENPI_PI05_BASE_CHECKPOINT=/home/dongxiaokun/baseck/pi05_base
+export OPENPI_LEROBOT_V3_SRC=/home/dongxiaokun/LeTools-Learning/kuavo_model/external_models/openpi/third_party/try
+```
+
+先计算独立 norm stats：
+
+```bash
+.venv/bin/python scripts/compute_norm_stats.py \
+  --config-name demovla_kuavo_right_dynamic_gate
+```
+
+输出必须位于：
+
+```text
+assets/demovla_kuavo_right_dynamic_gate/kuavo_right/norm_stats.json
+```
+
+然后使用 8 卡启动训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/train.py \
+  demovla_kuavo_right_dynamic_gate \
+  --exp-name kuavo_right_prompt_unchanged_v1 \
+  --overwrite
+```
+
+该配置从 `pi0.5 base` 初始化，action horizon 为 10；前 7 维绝对关节目标在
+训练前变换为相对当前 state 的 delta，夹爪第 8 维保持绝对量。8 维 state 经
+归一化后作为 pi0.5 的离散前缀 token 输入。冻结 dense LLM 参数，训练 LoRA、
+action/time projection 与完整 DemoVLA dynamic-gate 模块。
 
 ## 16. 成功标准
 

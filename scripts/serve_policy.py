@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import Literal
 
 import tyro
 
@@ -54,6 +55,12 @@ class Args:
     # This increases inference work and websocket payload size.
     interaction_diagnostics: bool = False
 
+    # Parameter-free DemoVLA inference ablation. ``layer_mean`` replaces the
+    # learned dynamic gate with one fixed probability per injection layer;
+    # ``off`` bypasses interaction-memory injection entirely.
+    interaction_ablation: Literal["normal", "layer_mean", "off"] = "normal"
+    interaction_layer_mean_gates: tuple[float, float, float] | None = None
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -99,6 +106,13 @@ def create_default_policy(
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     sample_kwargs = {"interaction_diagnostics": args.interaction_diagnostics}
+    if args.interaction_ablation != "normal" or args.interaction_layer_mean_gates is not None:
+        sample_kwargs.update(
+            {
+                "interaction_ablation": args.interaction_ablation,
+                "interaction_layer_mean_gates": args.interaction_layer_mean_gates or (),
+            }
+        )
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
@@ -108,6 +122,8 @@ def create_policy(args: Args) -> _policy.Policy:
                 sample_kwargs=sample_kwargs,
             )
         case Default():
+            if args.interaction_ablation != "normal" or args.interaction_layer_mean_gates is not None:
+                raise ValueError("interaction ablations require policy:checkpoint with a DemoVLA config")
             return create_default_policy(
                 args.env,
                 default_prompt=args.default_prompt,

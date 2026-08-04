@@ -198,6 +198,98 @@ def test_dynamic_gate_parameters_start_as_base_model_noop(dynamic_demovla_model)
     assert jnp.all(aux["injection_ratio"] == 0.0)
 
 
+def test_dynamic_gate_zero_injection_has_finite_gradients():
+    width = 4
+    embedding_dim = 2
+    hidden_dim = 3
+    horizon = 3
+    params = {
+        "norm_scale": jnp.ones((width,)),
+        "norm_bias": jnp.zeros((width,)),
+        "query_kernel": jnp.eye(width),
+        "query_bias": jnp.zeros((width,)),
+        "key_kernel": jnp.eye(width),
+        "key_bias": jnp.zeros((width,)),
+        "value_kernel": jnp.eye(width),
+        "value_bias": jnp.zeros((width,)),
+        # Match the exact no-op initialization used by DemoVLA.
+        "output_kernel": jnp.zeros((width, width)),
+        "output_bias": jnp.zeros((width,)),
+        "gate_norm_scale": jnp.ones((width,)),
+        "gate_norm_bias": jnp.zeros((width,)),
+        "slot_embeddings": jnp.zeros((horizon, embedding_dim)),
+        "layer_embeddings": jnp.zeros((1, embedding_dim)),
+        "gate_mlp_in_kernel": jax.random.normal(
+            jax.random.key(18),
+            (2 * width + 2 * embedding_dim, hidden_dim),
+        ),
+        "gate_mlp_in_bias": jnp.zeros((hidden_dim,)),
+        "gate_mlp_out_kernel": jnp.zeros((hidden_dim, 1)),
+        "gate_mlp_out_bias": jnp.full((1,), -4.0),
+    }
+    action_hidden = jax.random.normal(jax.random.key(19), (1, horizon, width))
+    memory = jax.random.normal(jax.random.key(20), (1, 2, width))
+    flow_time_embedding = jax.random.normal(jax.random.key(21), (1, width))
+
+    def adapter_output_sum(adapter_params):
+        (_, injected), _ = demovla._apply_sparse_deep_adapter(  # noqa: SLF001
+            1,
+            "dynamic",
+            adapter_params,
+            memory,
+            flow_time_embedding,
+            jnp.asarray((1,)),
+            jnp.asarray(1),
+            [None, action_hidden],
+        )
+        return jnp.sum(injected)
+
+    grads = jax.grad(adapter_output_sum)(params)
+
+    assert all(jnp.all(jnp.isfinite(gradient)) for gradient in jax.tree.leaves(grads))
+
+
+def test_dynamic_gate_layer_mean_ablation_uses_fixed_per_layer_gates(dynamic_demovla_model):
+    config, model = dynamic_demovla_model
+    layer_mean_gates = (0.0211, 0.0242, 0.0277)
+    model.configure_interaction_inference_ablation("layer_mean", layer_mean_gates)
+    action_hidden = jax.random.normal(
+        jax.random.key(22),
+        (1, config.action_horizon, model.demovla_action_output_proj.out_features),
+    )
+    memory = jax.random.normal(
+        jax.random.key(23),
+        (1, config.num_interaction_tokens, model.demovla_action_output_proj.out_features),
+    )
+    adapter = model._make_sparse_deep_adapter(  # noqa: SLF001
+        memory,
+        jnp.ones((1, model.demovla_action_output_proj.out_features)),
+    )
+
+    for layer, expected_gate in zip(config.interaction_injection_layers, layer_mean_gates, strict=True):
+        (_, _), aux = adapter(jnp.asarray(layer), [None, action_hidden])
+        assert jnp.allclose(aux["gate"], expected_gate)
+
+    model.configure_interaction_inference_ablation("normal")
+
+
+def test_dynamic_gate_layer_mean_ablation_validates_gate_count(dynamic_demovla_model):
+    _, model = dynamic_demovla_model
+    with pytest.raises(ValueError, match="one gate probability per injection layer"):
+        model.configure_interaction_inference_ablation("layer_mean", (0.02,))
+
+
+def test_dynamic_gate_model_instances_have_matching_graphdefs():
+    config = demovla.DemoVLAConfig(interaction_gate_mode="dynamic")
+    # Graph structure does not require materializing two multi-billion-parameter
+    # models. Keeping the models abstract also prevents this regression test from
+    # exhausting a single GPU after the module-scoped model fixtures are loaded.
+    first = nnx.graphdef(nnx.eval_shape(config.create, jax.random.key(16)))
+    second = nnx.graphdef(nnx.eval_shape(config.create, jax.random.key(17)))
+
+    assert jax.tree_util.tree_structure(first) == jax.tree_util.tree_structure(second)
+
+
 def test_dynamic_gate_loss_exports_layer_flow_bin_and_slot_metrics(dynamic_demovla_model):
     config, model = dynamic_demovla_model
     observation = config.fake_obs(batch_size=1)

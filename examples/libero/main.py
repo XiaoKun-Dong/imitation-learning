@@ -22,7 +22,7 @@ import tyro
 from openpi.models import demovla_visualization
 from openpi.shared import libero_runtime as _libero_runtime
 
-benchmark, get_libero_path, SegmentationRenderEnv = _libero_runtime.import_modules(
+benchmark, get_libero_path, OffScreenRenderEnv, SegmentationRenderEnv = _libero_runtime.import_modules(
     pathlib.Path(__file__).resolve().parents[2]
 )
 
@@ -61,6 +61,9 @@ class Args:
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
     debug_object_overlay: bool = False  # Overlay the live target mask and bbox on rollout videos.
+    # Optional failure taxonomy. Disabled for official-compatible evaluation so
+    # the normal rollout path only performs the operations in upstream OpenPI.
+    track_grasp_diagnostics: bool = False
     visualize_interaction_patches: bool = False
     # Save one interaction-attention panel per replan. Negative means all replans.
     interaction_visualizations_per_episode: int = -1
@@ -69,7 +72,7 @@ class Args:
     # Stateless flow-noise seed. Each replan uses
     # (policy_noise_seed, benchmark_task_id, episode_idx, replan_idx).
     # Set to None to restore the server's stateful RNG stream.
-    policy_noise_seed: int | None = 0
+    policy_noise_seed: int | None = None
 
 
 def eval_libero(args: Args) -> None:
@@ -123,7 +126,13 @@ def eval_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
-        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        needs_segmentation = args.object_condition != "none" or args.debug_object_overlay
+        env, task_description = _get_libero_env(
+            task,
+            LIBERO_ENV_RESOLUTION,
+            args.seed,
+            needs_segmentation=needs_segmentation,
+        )
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -281,13 +290,15 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
-                    step_target_grasped, step_wrong_object_grasped = _get_grasp_state(env)
-                    target_grasped |= step_target_grasped
-                    wrong_object_grasped |= step_wrong_object_grasped
+                    if args.track_grasp_diagnostics:
+                        step_target_grasped, step_wrong_object_grasped = _get_grasp_state(env)
+                        target_grasped |= step_target_grasped
+                        wrong_object_grasped |= step_wrong_object_grasped
                     if done:
                         # A successful pick-and-place implies the target was grasped even if a transient
                         # finger contact was missed between evaluation samples.
-                        target_grasped = True
+                        if args.track_grasp_diagnostics:
+                            target_grasped = True
                         task_successes += 1
                         total_successes += 1
                         break
@@ -322,8 +333,8 @@ def eval_libero(args: Args) -> None:
                 "difficulty_level": task_metadata.get("difficulty_level"),
                 "episode": episode_idx,
                 "success": bool(done),
-                "target_grasped": target_grasped,
-                "wrong_object_grasped": wrong_object_grasped,
+                "target_grasped": target_grasped if args.track_grasp_diagnostics else None,
+                "wrong_object_grasped": wrong_object_grasped if args.track_grasp_diagnostics else None,
                 "object_condition": args.object_condition,
                 "condition_object_name": condition_object_name,
                 "policy_noise_seed": args.policy_noise_seed,
@@ -336,30 +347,33 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Success: {done}")
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
-            logging.info(
-                "# target grasp failures: %d (%.1f%%)",
-                total_episodes - total_target_grasps,
-                (total_episodes - total_target_grasps) / total_episodes * 100,
-            )
+            if args.track_grasp_diagnostics:
+                logging.info(
+                    "# target grasp failures: %d (%.1f%%)",
+                    total_episodes - total_target_grasps,
+                    (total_episodes - total_target_grasps) / total_episodes * 100,
+                )
 
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        logging.info(f"Current task grasp failure rate: {1.0 - task_target_grasps / task_episodes}")
-        logging.info(
-            "Current task post-grasp failure rate: %.3f",
-            (task_target_grasps - task_successes) / task_target_grasps if task_target_grasps else 0.0,
-        )
-        logging.info(f"Current task wrong-object grasp rate: {task_wrong_object_grasps / task_episodes}")
+        if args.track_grasp_diagnostics:
+            logging.info(f"Current task grasp failure rate: {1.0 - task_target_grasps / task_episodes}")
+            logging.info(
+                "Current task post-grasp failure rate: %.3f",
+                (task_target_grasps - task_successes) / task_target_grasps if task_target_grasps else 0.0,
+            )
+            logging.info(f"Current task wrong-object grasp rate: {task_wrong_object_grasps / task_episodes}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
         env.close()
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
-    logging.info(f"Total grasp failure rate: {1.0 - total_target_grasps / total_episodes}")
-    logging.info(
-        "Total post-grasp failure rate: %.3f",
-        (total_target_grasps - total_successes) / total_target_grasps if total_target_grasps else 0.0,
-    )
-    logging.info(f"Total wrong-object grasp rate: {total_wrong_object_grasps / total_episodes}")
+    if args.track_grasp_diagnostics:
+        logging.info(f"Total grasp failure rate: {1.0 - total_target_grasps / total_episodes}")
+        logging.info(
+            "Total post-grasp failure rate: %.3f",
+            (total_target_grasps - total_successes) / total_target_grasps if total_target_grasps else 0.0,
+        )
+        logging.info(f"Total wrong-object grasp rate: {total_wrong_object_grasps / total_episodes}")
     logging.info(f"Total episodes: {total_episodes}")
 
 
@@ -423,7 +437,7 @@ def _select_tasks(args: Args, task_suite) -> list[tuple[int, dict]]:
     return selected
 
 
-def _get_libero_env(task, resolution, seed):
+def _get_libero_env(task, resolution, seed, *, needs_segmentation: bool = False):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
@@ -431,10 +445,16 @@ def _get_libero_env(task, resolution, seed):
         "bddl_file_name": str(task_bddl_file),
         "camera_heights": resolution,
         "camera_widths": resolution,
-        "camera_segmentations": "instance",
-        "camera_depths": True,
     }
-    env = SegmentationRenderEnv(**env_args)
+    if needs_segmentation:
+        env = SegmentationRenderEnv(
+            **env_args,
+            camera_segmentations="instance",
+            camera_depths=True,
+        )
+    else:
+        # Match the official OpenPI LIBERO evaluator exactly for normal rollouts.
+        env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 

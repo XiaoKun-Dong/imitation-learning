@@ -65,8 +65,24 @@ def _check_dataset(data_root: pathlib.Path, failures: list[str], *, required: bo
     )
 
 
+def _norm_stats_path(config_name: str) -> pathlib.Path:
+    from openpi.training import config as training_config
+
+    config = training_config.get_config(config_name)
+    data_assets = config.data.assets
+    assets_dir = pathlib.Path(data_assets.assets_dir or config.assets_dirs)
+    if not assets_dir.is_absolute():
+        assets_dir = PROJECT_ROOT / assets_dir
+    asset_id = data_assets.asset_id or config.data.repo_id
+    return assets_dir / asset_id / "norm_stats.json"
+
+
 def _check_norm_stats(config_name: str, failures: list[str], *, required: bool) -> None:
-    path = PROJECT_ROOT / "assets" / config_name / "local/libero/norm_stats.json"
+    try:
+        path = _norm_stats_path(config_name)
+    except Exception as exc:
+        _fail(f"cannot resolve norm stats for config {config_name}: {exc}", failures)
+        return
     if not path.is_file():
         message = f"norm stats not found at {path}"
         if required:
@@ -113,7 +129,8 @@ def main() -> int:
     parser.add_argument("--require-data", action="store_true")
     parser.add_argument("--require-norm-stats", action="store_true")
     parser.add_argument("--require-checkpoint", action="store_true")
-    parser.add_argument("--config-name", default="demovla_libero_sparse_deep_diverse")
+    parser.add_argument("--training-only", action="store_true")
+    parser.add_argument("--config-name", default="demovla_libero_sparse_deep_dynamic_gate")
     args = parser.parse_args()
 
     failures: list[str] = []
@@ -122,12 +139,16 @@ def main() -> int:
     else:
         _ok(f"Python {sys.version.split()[0]}")
 
-    for module_name in ("openpi", "jax", "torch", "lerobot", "mujoco"):
+    modules = ("openpi", "jax", "torch", "lerobot")
+    if not args.training_only:
+        modules += ("mujoco",)
+    for module_name in modules:
         _check_import(module_name, failures)
-    if importlib.util.find_spec("robosuite") is None:
-        _fail("robosuite is not installed", failures)
-    else:
-        _ok("robosuite is installed (renderer import deferred)")
+    if not args.training_only:
+        if importlib.util.find_spec("robosuite") is None:
+            _fail("robosuite is not installed", failures)
+        else:
+            _ok("robosuite is installed (renderer import deferred)")
 
     try:
         import jax
@@ -141,17 +162,18 @@ def main() -> int:
     except Exception as exc:
         _fail(f"cannot enumerate JAX devices: {exc}", failures)
 
-    try:
-        from openpi.shared import libero_runtime
+    if not args.training_only:
+        try:
+            from openpi.shared import libero_runtime
 
-        runtime = libero_runtime.prepare(PROJECT_ROOT)
-        importlib.import_module("libero.libero.benchmark")
-        if args.require_gpu:
-            libero_runtime.import_modules(PROJECT_ROOT)
-        _ok(f"LIBERO checkout {runtime.checkout_root}")
-        _ok(f"LIBERO config {runtime.config_dir / 'config.yaml'}")
-    except Exception as exc:
-        _fail(f"LIBERO runtime is not ready: {exc}", failures)
+            runtime = libero_runtime.prepare(PROJECT_ROOT)
+            importlib.import_module("libero.libero.benchmark")
+            if args.require_gpu:
+                libero_runtime.import_modules(PROJECT_ROOT)
+            _ok(f"LIBERO checkout {runtime.checkout_root}")
+            _ok(f"LIBERO config {runtime.config_dir / 'config.yaml'}")
+        except Exception as exc:
+            _fail(f"LIBERO runtime is not ready: {exc}", failures)
 
     data_root = pathlib.Path(os.environ.get("OPENPI_LIBERO_DATA_ROOT", "data/lerobot/local/libero"))
     if not data_root.is_absolute():

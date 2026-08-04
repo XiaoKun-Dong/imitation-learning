@@ -57,6 +57,49 @@ uv run python examples/libero/main.py \
 --args.num-trials-per-task 50
 ```
 
+普通评估默认遵循官方 OpenPI 口径：`OffScreenRenderEnv`、256 像素环境渲染、224 像素模型输入、
+图像旋转 180 度、等待 10 步、每 5 步 replan，并使用 policy server 的正常随机数流。只有显式传入
+`--args.policy-noise-seed` 时才固定每次 replan 的 flow noise；该选项用于配对消融，不作为官方最终成绩口径。
+
+## Dynamic gate 退化检查
+
+大规模评估前，先把 dynamic checkpoint 与两种基线做每任务 3 个 rollout 的配对检查：
+
+```bash
+bash examples/libero/eval_demovla_regression_pilot.sh \
+  checkpoints/demovla_libero_sparse_deep_dynamic_gate/dynamic_gate_v1/29999 \
+  /home/dongxiaokun/baseck/pi05_libero \
+  0 8000 3 7
+```
+
+三组分别是正常 dynamic gate、同一 checkpoint 关闭 interaction injection、官方 `pi05_libero` checkpoint。
+它们使用完全相同的初始状态和 flow noise。该 pilot 只用于发现明显退化；通过后，最终 50-rollout 官方口径
+应去掉 `--args.policy-noise-seed`，单独运行正常 dynamic gate。
+
+## Dynamic gate 配对消融
+
+以下脚本依次评估同一个 dynamic-gate checkpoint 的正常推理、逐层平均 gate、关闭 interaction injection，
+再评估单独训练的 static-deep checkpoint。四组使用相同的 LIBERO initial state 和
+`(noise_seed, task, episode, replan)` flow noise：
+
+```bash
+bash examples/libero/eval_demovla_gate_ablation.sh \
+  /path/to/dynamic/checkpoint/29999 \
+  /path/to/static-deep/checkpoint/29999 \
+  0 8000 50 7
+```
+
+默认逐层平均 gate 来自 dynamic 29999 日志：`0.0211 0.0242 0.0277`。可用训练末段多个日志点的均值覆盖：
+
+```bash
+LAYER_MEAN_GATES="<layer4> <layer9> <layer14>" \
+bash examples/libero/eval_demovla_gate_ablation.sh DYNAMIC_CKPT STATIC_CKPT
+```
+
+脚本最后输出成功率以及相对 dynamic 的逐 episode 配对结果和 McNemar exact p-value。static-deep
+checkpoint 必须使用与 dynamic 相同的数据、norm stats、训练步数和初始化权重；否则该组只能作为历史参考，
+不能单独归因于 gate 结构。
+
 ## 图形后端
 
 headless NVIDIA 机器推荐 EGL：

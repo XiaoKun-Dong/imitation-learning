@@ -1,22 +1,68 @@
 from collections.abc import Iterator, Sequence
+import importlib
+import inspect
 import logging
 import multiprocessing
 import os
+import pathlib
+import sys
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
-import openpi.models.model as _model
-import openpi.training.config as _config
-from openpi.training.droid_rlds_dataset import DroidRldsDataset
-import openpi.transforms as _transforms
-
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _import_lerobot_dataset_module():
+    """Import the pinned LeRobot loader or an explicitly supplied v3 source tree."""
+    if source_root := os.environ.get("OPENPI_LEROBOT_V3_SRC"):
+        source_path = pathlib.Path(source_root).expanduser().resolve()
+        if not (source_path / "lerobot/datasets/lerobot_dataset.py").is_file():
+            raise FileNotFoundError(
+                f"OPENPI_LEROBOT_V3_SRC must contain lerobot/datasets/lerobot_dataset.py, got {source_path}"
+            )
+        source_string = str(source_path)
+        if source_string not in sys.path:
+            sys.path.insert(0, source_string)
+        # Do not silently fall back to the pinned v2 loader if the explicitly
+        # requested v3 source is present but one of its dependencies is missing.
+        return importlib.import_module("lerobot.datasets.lerobot_dataset")
+
+    try:
+        return importlib.import_module("lerobot.datasets.lerobot_dataset")
+    except ModuleNotFoundError:
+        return importlib.import_module("lerobot.common.datasets.lerobot_dataset")
+
+
+lerobot_dataset = _import_lerobot_dataset_module()
+
+# Keep the LeRobot import above the heavier OpenPI model/config imports. Some
+# CUDA-enabled environments otherwise crash while loading LeRobot's native
+# video/Arrow dependencies after the OpenPI checkpoint stack has initialized.
+# This only changes native-library initialization order, not loader behavior.
+import openpi.models.model as _model  # noqa: E402
+import openpi.training.config as _config  # noqa: E402
+from openpi.training.droid_rlds_dataset import DroidRldsDataset  # noqa: E402
+import openpi.transforms as _transforms  # noqa: E402
+
+
+def _task_index_to_prompt(tasks) -> dict[int, str]:
+    """Normalize LeRobot v2 dict and v3 DataFrame task metadata."""
+    if tasks is None:
+        return {}
+    if isinstance(tasks, dict):
+        return {int(index): str(task) for index, task in tasks.items()}
+    if hasattr(tasks, "iterrows"):
+        columns = set(tasks.columns)
+        if {"task_index", "task"}.issubset(columns):
+            return {int(row["task_index"]): str(row["task"]) for _, row in tasks.iterrows()}
+        if "task_index" in columns:
+            return {int(row["task_index"]): str(task) for task, row in tasks.iterrows()}
+    raise TypeError(f"Unsupported LeRobot task metadata type: {type(tasks)}")
 
 
 class Dataset(Protocol[T_co]):
@@ -128,7 +174,11 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    load_videos: bool = True,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -138,16 +188,33 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.root)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        root=data_config.root,
-        delta_timestamps={
+    dataset_kwargs = {
+        "root": data_config.root,
+        "delta_timestamps": {
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
-    )
+    }
+    if (
+        data_config.video_backend is not None
+        and "video_backend" in inspect.signature(lerobot_dataset.LeRobotDataset).parameters
+    ):
+        dataset_kwargs["video_backend"] = data_config.video_backend
+    dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, **dataset_kwargs)
+    if not load_videos:
+        # LeRobot v3 stores video paths outside the parquet table and decides
+        # whether to decode them from metadata. Norm stats only need state and
+        # actions, so hiding video features avoids decoding every camera frame.
+        dataset_meta_object = getattr(dataset, "meta", None)
+        dataset_info = getattr(dataset_meta_object, "info", None)
+        if isinstance(dataset_info, dict) and isinstance(dataset_info.get("features"), dict):
+            dataset_info["features"] = {
+                key: value for key, value in dataset_info["features"].items() if value.get("dtype") != "video"
+            }
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(
+            dataset, [_transforms.PromptFromLeRobotTask(_task_index_to_prompt(dataset_meta.tasks))]
+        )
 
     return dataset
 

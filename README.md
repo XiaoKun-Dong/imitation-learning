@@ -45,10 +45,12 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```bash
 git clone <your-repository-url>
 cd openpi
-bash scripts/setup_demovla.sh
+bash scripts/setup_demovla.sh --skip-submodules
 ```
 
-GitHub HTTPS 较慢而 SSH 可用时：
+这条命令适用于只训练：不下载 ALOHA、LIBERO，也不检查仿真依赖。
+
+需要在同一台机器进行 LIBERO rollout 评估时，再初始化 LIBERO：
 
 ```bash
 OPENPI_LIBERO_REPO_URL=git@github.com:Lifelong-Robot-Learning/LIBERO.git \
@@ -63,7 +65,7 @@ bash scripts/setup_demovla.sh --with-rlds
 
 脚本会：
 
-1. 只初始化 LIBERO 子模块，不下载 ALOHA；
+1. training-only 模式跳过全部子模块；评估模式只初始化 LIBERO，不下载 ALOHA；
 2. 使用 Python 3.11 和 `uv.lock` 创建 `.venv`；
 3. 安装训练、评估与开发依赖；
 4. 检查 JAX、PyTorch、LeRobot、MuJoCo、Robosuite 和 LIBERO。
@@ -78,6 +80,7 @@ uv run python scripts/check_demovla_env.py
 
 ```bash
 uv run python scripts/check_demovla_env.py \
+  --training-only \
   --require-gpu \
   --require-data \
   --require-norm-stats \

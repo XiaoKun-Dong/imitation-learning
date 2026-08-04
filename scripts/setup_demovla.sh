@@ -66,7 +66,7 @@ if ((SKIP_SUBMODULES == 0)); then
   fi
 fi
 
-if [[ ! -f third_party/libero/setup.py && ! -f third_party/libero/LIBERO/setup.py ]]; then
+if ((SKIP_SUBMODULES == 0)) && [[ ! -f third_party/libero/setup.py && ! -f third_party/libero/LIBERO/setup.py ]]; then
   echo "LIBERO checkout is missing. Initialize the submodule or set it up under third_party/libero." >&2
   exit 1
 fi
@@ -80,7 +80,11 @@ GIT_LFS_SKIP_SMUDGE=1 uv "${sync_args[@]}"
 
 echo
 echo "Running environment checks..."
-.venv/bin/python scripts/check_demovla_env.py
+check_args=()
+if ((SKIP_SUBMODULES == 1)); then
+  check_args+=(--training-only)
+fi
+.venv/bin/python scripts/check_demovla_env.py "${check_args[@]}"
 
 echo
 echo "DemoVLA environment is ready."
