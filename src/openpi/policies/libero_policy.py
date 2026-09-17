@@ -13,10 +13,6 @@ def make_libero_example() -> dict:
         "observation/state": np.random.rand(8),
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "target_mask": np.zeros((224, 224), dtype=bool),
-        "target_bbox": np.zeros((4,), dtype=np.float32),
-        "target_crop": np.zeros((224, 224, 3), dtype=np.uint8),
-        "target_point": np.zeros((3,), dtype=np.float32),
         "prompt": "do something",
     }
 
@@ -28,15 +24,6 @@ def _parse_image(image) -> np.ndarray:
     if image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
     return image
-
-
-def _parse_mask(mask) -> np.ndarray:
-    mask = np.asarray(mask)
-    if mask.ndim == 3:
-        if mask.shape[0] in (1, 3) and mask.shape[-1] not in (1, 3):
-            mask = einops.rearrange(mask, "c h w -> h w c")
-        mask = mask[..., 0]
-    return mask > 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,17 +73,6 @@ class LiberoInputs(transforms.DataTransformFn):
         # Actions are only available during training.
         if "actions" in data:
             inputs["actions"] = data["actions"]
-
-        # Optional object-centric inputs for the pi0.5 mask experiment.
-        # These are aligned to observation/image and are consumed only by the action expert.
-        if "target_mask" in data:
-            inputs["target_mask"] = _parse_mask(data["target_mask"])
-        if "target_bbox" in data:
-            inputs["target_bbox"] = np.asarray(data["target_bbox"], dtype=np.float32)
-        if "target_crop" in data:
-            inputs["target_crop"] = _parse_image(data["target_crop"])
-        if "target_point" in data:
-            inputs["target_point"] = np.asarray(data["target_point"], dtype=np.float32)
 
         # Pass the prompt (aka language instruction) to the model.
         # Keep this for your own dataset (but modify the key if the instruction is not

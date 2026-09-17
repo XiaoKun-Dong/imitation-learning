@@ -208,7 +208,6 @@ layer-wise injection ratio 之前，不能将 gate 直接等价为实际层贡�
 - 任务数：10
 - 正式评估：每任务 5 trials，共 50 episodes
 - Seed：7
-- Object condition：`none`
 - Replan interval：5 environment steps
 - Policy GPU：0
 - Checkpoint：`/home/dongxiaokun/checkpoints/deep/10000`
@@ -277,8 +276,8 @@ pilot 启用了 Interaction diagnostics，生成 10 个视频和 364 张以 repl
 
 ### 4.4 与无 Diversity 10k 的对齐比较
 
-已有无 diversity sparse-deep 10k 评估包含相同 10 个任务、seed 7、
-`object_condition=none`，每任务 10 trials。取其中 episode 0～4，可以与当前
+已有无 diversity sparse-deep 10k 评估包含相同 10 个任务、seed 7，且只使用
+标准 RGB、语言和机器人状态输入，每任务 10 trials。取其中 episode 0～4，可以与当前
 diverse eval5 对齐相同 benchmark initial states：
 
 | 模型 | Episodes | Success | 未抓到目标 | 抓错物体 | Post-grasp fail |
@@ -390,7 +389,6 @@ juice 的多 initial-state 结果更弱。
 - 完全相同的 task IDs；
 - 完全相同的 initial-state/seed 集合；
 - 完全相同的 `policy_noise_seed`，使每个 replan 的 flow noise 对齐；
-- `object_condition=none`；
 - 相同 replan interval；
 - 相同环境最大步数和成功判定。
 

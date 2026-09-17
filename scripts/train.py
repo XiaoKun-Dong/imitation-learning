@@ -31,7 +31,7 @@ import openpi.training.weight_loaders as _weight_loaders
 
 _DEMOVLA_PARAMS_FILTER = nnx_utils.PathRegex("demovla_.*")
 _DEMOVLA_INJECTION_FILTER = nnx_utils.PathRegex(
-    r"demovla_(action_query_.*|memory_(key|value)_proj.*|action_output_proj.*|interaction_gates|dynamic_gate_.*)"
+    r"demovla_(action_query_.*|memory_(key|value)_proj.*|action_output_proj.*|interaction_gates|dynamic_gate_.*|readout_.*)"
 )
 _DEMOVLA_EXTRACTOR_FILTER = nnx.All(_DEMOVLA_PARAMS_FILTER, nnx.Not(_DEMOVLA_INJECTION_FILTER))
 _DEMOVLA_OUTPUT_PROJ_FILTER = nnx_utils.PathRegex("demovla_action_output_proj/.*")
@@ -83,6 +83,15 @@ def _append_metrics_jsonl(path: pathlib.Path, step: int, metrics: dict[str, Any]
     record = {"step": step, **{key: np.asarray(value).item() for key, value in metrics.items()}}
     with path.open("a", encoding="utf-8") as metrics_file:
         metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _format_console_metric(key: str, value: Any) -> str:
+    """Format scalar metrics without assuming every auxiliary value is numeric."""
+    array = np.asarray(value)
+    if array.ndim == 0 and np.issubdtype(array.dtype, np.number):
+        return f"{key}={array.item():.4f}"
+    rendered = array.item() if array.ndim == 0 else array.tolist()
+    return f"{key}={rendered}"
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -178,7 +187,7 @@ def train_step(
         else:
             chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         loss = jnp.mean(chunked_loss)
-        task_chunked_loss = chunked_loss - model_metrics.get("demovla_diversity_regularization", 0.0)
+        task_chunked_loss = chunked_loss - model_metrics.get("demovla_auxiliary_regularization", 0.0)
         horizon_metrics = {
             "loss_action_first": jnp.mean(task_chunked_loss[..., 0]),
             "loss_action_middle": jnp.mean(task_chunked_loss[..., task_chunked_loss.shape[-1] // 2]),
@@ -253,12 +262,6 @@ def train_step(
             for label, raw_gate, gate in zip(gate_labels, raw_gates, gates, strict=True):
                 info[f"demovla_gate_{label}_raw"] = raw_gate
                 info[f"demovla_gate_{label}"] = gate
-    if getattr(model, "object_condition_use_gate", False):
-        raw_gate = model.object_condition_gate.value
-        gate = jax.nn.sigmoid(raw_gate)
-        info["object_condition_gate_raw"] = raw_gate
-        info["object_condition_gate"] = gate
-        info["object_condition_effective_scale"] = gate
     return new_state, info
 
 
@@ -346,7 +349,7 @@ def main(config: _config.TrainConfig):
                 for key, value in reduced_info.items()
                 if "_flow_bin_" not in key and "_slot_" not in key
             }
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in console_info.items())
+            info_str = ", ".join(_format_console_metric(key, value) for key, value in console_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             _append_metrics_jsonl(config.checkpoint_dir / "metrics.jsonl", step, reduced_info)

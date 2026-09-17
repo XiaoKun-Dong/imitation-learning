@@ -254,7 +254,6 @@ MUJOCO_GL=egl \
 MUJOCO_EGL_DEVICE_ID=0 \
 uv run python examples/libero/main.py \
   --args.task-suite-name libero_object \
-  --args.object-condition none \
   --args.num-trials-per-task 1 \
   --args.seed 7 \
   --args.policy-noise-seed 0 \
@@ -360,7 +359,6 @@ uv run pytest -q src/openpi/models/demovla_test.py
 - [DemoVLA 架构、训练与可视化](docs/demovla.md)
 - [Sparse-deep 训练报告](docs/demovla_sparse_deep_training_report.md)
 - [Diversity 10k 训练与评估报告](docs/demovla_sparse_deep_diversity_10k.md)
-- [历史 object-condition 实验](docs/pi05_object_mask_todo.md)
 
 ## 致谢与许可
 

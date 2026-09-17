@@ -49,10 +49,19 @@ class CheckpointWeightLoader(WeightLoader):
     # Regex for parameters that may be absent from the source checkpoint and
     # should retain their freshly initialized values.
     missing_regex: str = ".*lora.*"
+    # Parameters matching this regex are deliberately not restored. They must
+    # also match ``missing_regex`` so their freshly initialized values survive.
+    skip_regex: str | None = None
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        if self.skip_regex is not None:
+            flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+            skip_pattern = re.compile(self.skip_regex)
+            loaded_params = flax.traverse_util.unflatten_dict(
+                {key: value for key, value in flat_loaded.items() if not skip_pattern.fullmatch(key)}, sep="/"
+            )
         return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 

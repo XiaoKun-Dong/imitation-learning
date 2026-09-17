@@ -114,4 +114,4 @@ def import_modules(project_root: pathlib.Path | None = None):
     libero_package = importlib.import_module("libero.libero")
     benchmark = importlib.import_module("libero.libero.benchmark")
     envs = importlib.import_module("libero.libero.envs")
-    return benchmark, libero_package.get_libero_path, envs.OffScreenRenderEnv, envs.SegmentationRenderEnv
+    return benchmark, libero_package.get_libero_path, envs.OffScreenRenderEnv

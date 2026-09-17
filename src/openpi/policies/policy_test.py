@@ -60,6 +60,58 @@ def test_diagnostics_do_not_change_the_action_sampling_path():
     assert sample_calls == [("device", "observation"), ("device", "observation")]
 
 
+def test_action_diagnostics_receive_the_sampling_rng_and_noise():
+    policy = object.__new__(_policy.Policy)
+    noise = np.arange(6, dtype=np.float32).reshape(2, 3)
+    policy._sample_actions = lambda rng, observation, **kwargs: kwargs["noise"] * 2.0  # noqa: SLF001
+    policy._interaction_diagnostics = True  # noqa: SLF001
+    policy._interaction_diagnostics_uses_sampling_context = True  # noqa: SLF001
+    policy._interaction_diagnostics_fn = (  # noqa: SLF001
+        lambda rng, observation, **kwargs: {"rng": rng, "observation": observation, "noise": kwargs["noise"]}
+    )
+
+    actions, diagnostics = policy._sample_actions_and_maybe_diagnostics(  # noqa: SLF001
+        "rng",
+        "observation",
+        {"noise": noise},
+    )
+
+    assert np.array_equal(actions, noise * 2.0)
+    assert diagnostics["rng"] == "rng"
+    assert diagnostics["observation"] == "observation"
+    assert np.array_equal(diagnostics["noise"], noise)
+
+
+def test_memory_source_intervention_bypasses_shared_observation_sampler_and_diagnostics():
+    policy = object.__new__(_policy.Policy)
+    noise = np.arange(6, dtype=np.float32).reshape(2, 3)
+    calls = []
+    policy._sample_actions = lambda *args, **kwargs: pytest.fail("shared sampler should not run")  # noqa: SLF001
+    policy._sample_actions_with_memory_source = (  # noqa: SLF001
+        lambda rng, action_observation, memory_observation, **kwargs: calls.append(
+            (rng, action_observation, memory_observation, kwargs["interaction_memory_override"])
+        )
+        or kwargs["noise"] * 3.0
+    )
+    policy._interaction_diagnostics = True  # noqa: SLF001
+    policy._interaction_diagnostics_fn = lambda *_args, **_kwargs: pytest.fail("diagnostics should not run")  # noqa: SLF001
+    override = np.ones((1, 4, 8), dtype=np.float32)
+
+    actions, diagnostics = policy._sample_actions_and_maybe_diagnostics(  # noqa: SLF001
+        "rng",
+        "action_observation",
+        {"noise": noise},
+        memory_observation="memory_observation",
+        interaction_memory_override=override,
+    )
+
+    assert np.array_equal(actions, noise * 3.0)
+    assert diagnostics is None
+    assert len(calls) == 1
+    assert calls[0][:3] == ("rng", "action_observation", "memory_observation")
+    assert np.array_equal(calls[0][3], override)
+
+
 @pytest.mark.manual
 def test_infer():
     config = _config.get_config("pi0_aloha_sim")

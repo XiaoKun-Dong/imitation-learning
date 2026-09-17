@@ -45,7 +45,19 @@ _PI05_LIBERO_CHECKPOINT = os.environ.get(
     "OPENPI_PI05_LIBERO_CHECKPOINT",
     "gs://openpi-assets/checkpoints/pi05_libero",
 )
+_DEMOVLA_STAGE_A_PARAMS = os.environ.get(
+    "OPENPI_DEMOVLA_STAGE_A_PARAMS",
+    "checkpoints/demovla_libero_full_stage_a_fixed_gate/stage_a_fixed005_seed42_v2/4999/params",
+)
 _DEMOVLA_LIBERO_DATA_ROOT = os.environ.get("OPENPI_LIBERO_DATA_ROOT", "data/lerobot/local/libero")
+_LIBERO_FULL_DATA_ROOT = os.environ.get(
+    "OPENPI_LIBERO_FULL_DATA_ROOT",
+    "data/lerobot/physical-intelligence/libero",
+)
+_LIBERO_FULL_STATS_ROOT = os.environ.get(
+    "OPENPI_LIBERO_FULL_STATS_ROOT",
+    "assets/libero_full_matched",
+)
 _DEMOVLA_KUAVO_RIGHT_DATA_ROOT = os.environ.get(
     "OPENPI_KUAVO_RIGHT_DATA_ROOT",
     "/home/dongxiaokun/小件钢圈上料/lerobot",
@@ -57,26 +69,26 @@ def _checkpoint_subdir(checkpoint_root: str, subdir: str) -> str:
     return f"{checkpoint_root.rstrip('/')}/{subdir}"
 
 
-def _freeze_vla_backbone_filter() -> Filter:
-    """Freeze the VLA backbone and leave action/object adapters trainable."""
-    action_expert_filter = nnx_utils.PathRegex("PaliGemma/llm/.*_1.*")
-    return nnx.Any(
-        nnx_utils.PathRegex("PaliGemma/img/.*"),
-        nnx.All(
-            nnx_utils.PathRegex("PaliGemma/llm/.*"),
-            nnx.Not(action_expert_filter),
-        ),
-    )
-
-
-def _freeze_all_except_object_condition_filter() -> Filter:
-    """Freeze every legacy parameter and train only object cross-attention."""
-    return nnx.Not(nnx_utils.PathRegex("object_condition_.*"))
-
-
 def _freeze_all_except_demovla_filter() -> Filter:
     """Freeze pi0.5 and train only DemoVLA interaction-memory parameters."""
     return nnx.Not(nnx_utils.PathRegex("demovla_.*"))
+
+
+def _freeze_all_except_demovla_with_fixed_gates_filter() -> Filter:
+    """Freeze pi0.5 and the scalar gates while pretraining the DemoVLA branch."""
+    return nnx.Any(
+        nnx.Not(nnx_utils.PathRegex("demovla_.*")),
+        nnx_utils.PathRegex("demovla_interaction_gates"),
+    )
+
+
+def _freeze_all_except_demovla_readout_filter() -> Filter:
+    """Freeze the backbone, memory extractor, and fixed gates; train only memory readout."""
+    return nnx.Not(
+        nnx_utils.PathRegex(
+            r"demovla_(action_query_.*|memory_(key|value)_proj.*|action_output_proj.*|readout_.*)"
+        )
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -343,8 +355,6 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
-    include_object_condition: bool = False
-    object_condition_keys: tuple[str, ...] | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -363,17 +373,6 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             "actions": "actions",
             "prompt": "prompt",
         }
-        if self.include_object_condition or self.object_condition_keys:
-            object_condition_keys = self.object_condition_keys or (
-                "target_mask",
-                "target_bbox",
-                "target_crop",
-                "target_point",
-            )
-            invalid_keys = set(object_condition_keys) - {"target_mask", "target_bbox", "target_crop", "target_point"}
-            if invalid_keys:
-                raise ValueError(f"Invalid object condition keys: {sorted(invalid_keys)}")
-            repack_structure.update({key: key for key in object_condition_keys})
 
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
 
@@ -431,6 +430,7 @@ class LeRobotKuavoRightDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
             inputs=[
+                kuavo_policy.KuavoRightArmOnly(),
                 _transforms.RepackTransform(
                     {
                         "cam_h": "observation.images.head_cam_h",
@@ -439,7 +439,7 @@ class LeRobotKuavoRightDataConfig(DataConfigFactory):
                         "actions": "action",
                         "prompt": "prompt",
                     }
-                )
+                ),
             ]
         )
         data_transforms = _transforms.Group(
@@ -456,6 +456,7 @@ class LeRobotKuavoRightDataConfig(DataConfigFactory):
 
         norm_stats_transforms = _transforms.Group(
             inputs=[
+                kuavo_policy.KuavoRightArmOnly(),
                 _transforms.RepackTransform(
                     {
                         "state": "observation.state",
@@ -678,43 +679,6 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
-def _make_pi05_libero_object_mask_ablation_config(
-    *,
-    name: str,
-    object_condition_keys: Sequence[str],
-    object_condition_dropout_rate: float = 0.1,
-) -> TrainConfig:
-    return TrainConfig(
-        name=name,
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=False,
-            object_condition_dropout_rate=object_condition_dropout_rate,
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            object_condition_keys=tuple(object_condition_keys),
-        ),
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_BASE_CHECKPOINT, "params")),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        freeze_filter=_freeze_vla_backbone_filter(),
-        num_train_steps=30_000,
-    )
-
-
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -920,6 +884,333 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    # Strict full-LIBERO comparison pair. These configs intentionally share
+    # every training variable except the model architecture and the DemoVLA
+    # parameters that are absent from pi0.5.
+    TrainConfig(
+        name="pi05_libero_full_matched",
+        project_name="demovla",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            root=_LIBERO_FULL_DATA_ROOT,
+            assets=AssetsConfig(
+                assets_dir=_LIBERO_FULL_STATS_ROOT,
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_BASE_CHECKPOINT, "params")),
+        num_train_steps=30_000,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=10_000,
+        fsdp_devices=4,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="demovla_libero_full_matched",
+        project_name="demovla",
+        model=demovla.DemoVLAConfig(
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="dynamic",
+            interaction_gate_init=-3.0,
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            root=_LIBERO_FULL_DATA_ROOT,
+            assets=AssetsConfig(
+                assets_dir=_LIBERO_FULL_STATS_ROOT,
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _checkpoint_subdir(_PI05_BASE_CHECKPOINT, "params"),
+            missing_regex=".*demovla.*",
+        ),
+        num_train_steps=30_000,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=10_000,
+        fsdp_devices=4,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="demovla_libero_full_stage_a_fixed_gate",
+        project_name="demovla",
+        model=demovla.DemoVLAConfig(
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="scalar",
+            # logit(0.05): all three layer gates are fixed at 5% during stage A.
+            interaction_gate_init=-2.9444389791664403,
+            # Avoid the zero-projection cold start while keeping the initial
+            # residual small: expected kernel std is 1e-3.
+            interaction_output_init_std=1e-3,
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            root=_LIBERO_FULL_DATA_ROOT,
+            assets=AssetsConfig(
+                # The frozen backbone and normalization statistics come from
+                # the same official pi0.5 LIBERO checkpoint.
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=5_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
+            missing_regex=".*(lora|demovla).*",
+        ),
+        freeze_filter=_freeze_all_except_demovla_with_fixed_gates_filter(),
+        num_train_steps=5_000,
+        log_interval=100,
+        save_interval=1_000,
+        keep_period=1_000,
+        fsdp_devices=4,
+        wandb_enabled=True,
+    ),
+    # B1 causal pair: both arms start from the exact Stage A checkpoint, reset
+    # the frozen scalar gate from 0.05 to 0.03, and train readout parameters only.
+    TrainConfig(
+        name="demovla_libero_full_b1_readout_control",
+        project_name="demovla",
+        model=demovla.DemoVLAConfig(
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="scalar",
+            interaction_gate_init=-3.4760986898352733,  # logit(0.03)
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            root=_LIBERO_FULL_DATA_ROOT,
+            assets=AssetsConfig(
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=3e-5,
+            decay_steps=1_200,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _DEMOVLA_STAGE_A_PARAMS,
+            missing_regex=r".*demovla_interaction_gates.*",
+            skip_regex=r".*demovla_interaction_gates.*",
+        ),
+        freeze_filter=_freeze_all_except_demovla_readout_filter(),
+        num_train_steps=1_200,
+        log_interval=25,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=4,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="demovla_libero_full_b1_readout_recovery",
+        project_name="demovla",
+        model=demovla.DemoVLAConfig(
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="scalar",
+            interaction_gate_init=-3.4760986898352733,  # logit(0.03)
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+            interaction_readout_mode="recovery",
+            interaction_readout_temperature_min=0.5,
+            interaction_readout_temperature_max=2.0,
+            interaction_readout_temperature_init=1.0,
+            interaction_memory_ranking_weight=1.0,
+            interaction_memory_ranking_margin=2e-5,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            root=_LIBERO_FULL_DATA_ROOT,
+            assets=AssetsConfig(
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=3e-5,
+            decay_steps=1_200,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _DEMOVLA_STAGE_A_PARAMS,
+            missing_regex=r".*demovla_(interaction_gates|readout_.*).*",
+            skip_regex=r".*demovla_interaction_gates.*",
+        ),
+        freeze_filter=_freeze_all_except_demovla_readout_filter(),
+        num_train_steps=1_200,
+        log_interval=25,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=4,
+        wandb_enabled=True,
+    ),
+    # S1 isolates a single training factor: same-image, wrong-prompt memory
+    # ranking. There are deliberately no readout architecture changes.
+    TrainConfig(
+        name="demovla_libero_full_s1_semantic_control",
+        project_name="demovla",
+        model=demovla.DemoVLAConfig(
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="scalar",
+            interaction_gate_init=-3.4760986898352733,
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            root=_LIBERO_FULL_DATA_ROOT,
+            assets=AssetsConfig(
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=3e-5,
+            decay_steps=1_200,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _DEMOVLA_STAGE_A_PARAMS,
+            missing_regex=r".*demovla_interaction_gates.*",
+            skip_regex=r".*demovla_interaction_gates.*",
+        ),
+        freeze_filter=_freeze_all_except_demovla_readout_filter(),
+        num_train_steps=1_200,
+        log_interval=25,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=4,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="demovla_libero_full_s1_semantic_ranking",
+        project_name="demovla",
+        model=demovla.DemoVLAConfig(
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="scalar",
+            interaction_gate_init=-3.4760986898352733,
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+            interaction_memory_ranking_weight=0.25,
+            interaction_memory_ranking_margin=2e-5,
+            interaction_memory_ranking_mode="prompt_hard_negative",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            root=_LIBERO_FULL_DATA_ROOT,
+            assets=AssetsConfig(
+                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=3e-5,
+            decay_steps=1_200,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _DEMOVLA_STAGE_A_PARAMS,
+            missing_regex=r".*demovla_interaction_gates.*",
+            skip_regex=r".*demovla_interaction_gates.*",
+        ),
+        freeze_filter=_freeze_all_except_demovla_readout_filter(),
+        num_train_steps=1_200,
+        log_interval=25,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=4,
+        wandb_enabled=True,
+    ),
     TrainConfig(
         name="demovla_libero_single_shot",
         model=demovla.DemoVLAConfig(interaction_injection_mode="single_shot"),
@@ -945,7 +1236,7 @@ _CONFIGS = [
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader(
             _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
-            missing_regex=".*(lora|object_condition|demovla).*",
+            missing_regex=".*(lora|demovla).*",
         ),
         freeze_filter=_freeze_all_except_demovla_filter(),
         num_train_steps=30_000,
@@ -981,7 +1272,7 @@ _CONFIGS = [
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader(
             _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
-            missing_regex=".*(lora|object_condition|demovla).*",
+            missing_regex=".*(lora|demovla).*",
         ),
         freeze_filter=_freeze_all_except_demovla_filter(),
         num_train_steps=30_000,
@@ -1017,7 +1308,7 @@ _CONFIGS = [
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader(
             _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
-            missing_regex=".*(lora|object_condition|demovla).*",
+            missing_regex=".*(lora|demovla).*",
         ),
         freeze_filter=_freeze_all_except_demovla_filter(),
         num_train_steps=30_000,
@@ -1058,13 +1349,62 @@ _CONFIGS = [
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader(
             _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
-            missing_regex=".*(lora|object_condition|demovla).*",
+            missing_regex=".*(lora|demovla).*",
         ),
         freeze_filter=_freeze_all_except_demovla_filter(),
         num_train_steps=30_000,
         log_interval=1_000,
         save_interval=5_000,
         keep_period=1_000,
+    ),
+    TrainConfig(
+        name="demovla_libero_sparse_deep_dynamic_gate_m3",
+        project_name="demovla",
+        model=demovla.DemoVLAConfig(
+            interaction_injection_mode="sparse_deep",
+            interaction_injection_layers=(4, 9, 14),
+            interaction_gate_mode="dynamic",
+            # sigmoid(-3) = 0.0474, versus 0.0180 for the default -4.
+            # The adapter output projection remains zero-initialized, so the
+            # model is still an exact pi0.5 no-op at initialization.
+            interaction_gate_init=-3.0,
+            interaction_attention_diversity_weight=1e-3,
+            interaction_attention_diversity_margin=0.5,
+            interaction_memory_diversity_weight=1e-4,
+            interaction_memory_diversity_margin=0.5,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="local/libero",
+            root=_DEMOVLA_LIBERO_DATA_ROOT,
+            assets=AssetsConfig(
+                assets_dir="assets/demovla_libero_sparse_deep_diverse",
+                asset_id="local/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params"),
+            missing_regex=".*(lora|demovla).*",
+        ),
+        freeze_filter=_freeze_all_except_demovla_filter(),
+        # Match the official pi05_libero fine-tuning duration.
+        num_train_steps=30_000,
+        log_interval=1_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        # One FSDP group spanning the four GPUs selected by the launcher.
+        fsdp_devices=4,
     ),
     TrainConfig(
         name="demovla_kuavo_right_dynamic_gate",
@@ -1122,160 +1462,6 @@ _CONFIGS = [
             "control_frequency_hz": 10,
             "prompt": "Pick and Place",
         },
-    ),
-    TrainConfig(
-        name="pi05_libero_object_mask",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            include_object_condition=True,
-        ),
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_BASE_CHECKPOINT, "params")),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        freeze_filter=_freeze_vla_backbone_filter(),
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi05_libero_object_cross_attention",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            assets=AssetsConfig(
-                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
-                asset_id="physical-intelligence/libero",
-            ),
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            include_object_condition=True,
-        ),
-        batch_size=1,
-        num_workers=4,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=100,
-            peak_lr=1e-5,
-            decay_steps=1_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params")),
-        freeze_filter=_freeze_all_except_object_condition_filter(),
-        num_train_steps=1_000,
-        save_interval=250,
-        keep_period=250,
-    ),
-    TrainConfig(
-        name="pi05_libero_object_2d_cross_attention",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False, object_condition_dropout_rate=0.1
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            assets=AssetsConfig(
-                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
-                asset_id="physical-intelligence/libero",
-            ),
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            object_condition_keys=("target_mask", "target_bbox", "target_crop"),
-        ),
-        batch_size=1,
-        num_workers=4,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=100,
-            peak_lr=1e-5,
-            decay_steps=1_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params")),
-        freeze_filter=_freeze_all_except_object_condition_filter(),
-        num_train_steps=1_000,
-        save_interval=250,
-        keep_period=250,
-    ),
-    TrainConfig(
-        name="pi05_libero_object_2d_step1",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=False,
-            object_condition_dropout_rate=0.1,
-            object_condition_encoder_layers=2,
-            object_condition_encoder_mlp_ratio=4,
-            object_condition_use_gate=True,
-            object_condition_gate_init=-4.0,
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="local/libero_object_mask",
-            root="data/lerobot/local/libero_object_mask",
-            assets=AssetsConfig(
-                assets_dir=_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "assets"),
-                asset_id="physical-intelligence/libero",
-            ),
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            object_condition_keys=("target_mask", "target_bbox", "target_crop"),
-        ),
-        batch_size=8,
-        num_workers=4,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
-            peak_lr=1e-5,
-            decay_steps=5_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader(_checkpoint_subdir(_PI05_LIBERO_CHECKPOINT, "params")),
-        freeze_filter=_freeze_all_except_object_condition_filter(),
-        num_train_steps=5_000,
-        save_interval=1_000,
-        keep_period=1_000,
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_none",
-        object_condition_keys=(),
-        object_condition_dropout_rate=0.0,
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_bbox_only",
-        object_condition_keys=("target_bbox",),
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_mask_only",
-        object_condition_keys=("target_mask",),
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_crop_only",
-        object_condition_keys=("target_crop",),
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_point_only",
-        object_condition_keys=("target_point",),
-    ),
-    _make_pi05_libero_object_mask_ablation_config(
-        name="pi05_libero_object_mask_point",
-        object_condition_keys=("target_mask", "target_point"),
     ),
     #
     # Fine-tuning Aloha configs.

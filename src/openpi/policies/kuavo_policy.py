@@ -23,6 +23,11 @@ def make_kuavo_right_example() -> dict:
 
 def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
+    # The Kuavo ROS deployment returns torch tensors with a leading singleton
+    # batch dimension, while the training transforms operate on individual
+    # samples. Accept both representations at this boundary.
+    if image.ndim == 4 and image.shape[0] == 1:
+        image = image[0]
     if np.issubdtype(image.dtype, np.floating):
         scale = 255.0 if image.max(initial=0.0) <= 1.0 else 1.0
         image = np.clip(image * scale, 0, 255).astype(np.uint8)
@@ -34,6 +39,29 @@ def _parse_image(image) -> np.ndarray:
 
 
 @dataclasses.dataclass(frozen=True)
+class KuavoRightArmOnly(transforms.DataTransformFn):
+    """Select the right arm from a 16-D left+right Kuavo sample.
+
+    Existing 8-D right-arm datasets pass through unchanged. This keeps the
+    deployment interface and normalization statistics consistently 8-D.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        result = dict(data)
+        for key in ("observation.state", "action"):
+            if key not in result:
+                continue
+            value = np.asarray(result[key])
+            if value.dtype == object:
+                value = np.asarray(value.tolist())
+            if value.shape[-1] == 16:
+                result[key] = value[..., 8:16]
+            elif value.shape[-1] != 8:
+                raise ValueError(f"Kuavo {key} must be 8-D or 16-D, got {value.shape}")
+        return result
+
+
+@dataclasses.dataclass(frozen=True)
 class KuavoRightInputs(transforms.DataTransformFn):
     """Map head/right-wrist RGB and 8-D right-arm state into OpenPI inputs."""
 
@@ -42,11 +70,14 @@ class KuavoRightInputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["cam_h"])
         right_wrist_image = _parse_image(data["cam_r"])
-        if np.asarray(data["state"]).shape[-1] != 8:
-            raise ValueError(f"Kuavo right-arm state must be 8-D, got {np.asarray(data['state']).shape}")
+        state = np.asarray(data["state"])
+        if state.ndim == 2 and state.shape[0] == 1:
+            state = state[0]
+        if state.shape != (8,):
+            raise ValueError(f"Kuavo right-arm state must be 8-D, got {state.shape}")
 
         inputs = {
-            "state": data["state"],
+            "state": state,
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": np.zeros_like(base_image),

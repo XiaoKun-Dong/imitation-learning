@@ -130,7 +130,6 @@ run_one() {
     --args.host 127.0.0.1 \
     --args.port "$PORT" \
     --args.task-suite-name libero_object \
-    --args.object-condition none \
     --args.num-trials-per-task "$TRIALS" \
     --args.seed "$SEED" \
     --args.policy-noise-seed "$FLOW_NOISE_SEED" \

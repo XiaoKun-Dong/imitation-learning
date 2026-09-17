@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 4 || $# -gt 6 ]]; then
+if [[ $# -lt 3 || $# -gt 5 ]]; then
   cat >&2 <<'EOF'
 Usage:
-  eval_libero_plus_single.sh LABEL OBJECT_CONDITION POLICY_CONFIG POLICY_DIR [GPU] [PORT]
+  eval_libero_plus_single.sh LABEL POLICY_CONFIG POLICY_DIR [GPU] [PORT]
 
 Runs the 50-task LIBERO-plus Objects Layout evaluation sequentially for seeds
 7, 42, and 123 on one GPU.
@@ -13,11 +13,10 @@ EOF
 fi
 
 LABEL=$1
-OBJECT_CONDITION=$2
-POLICY_CONFIG=$3
-POLICY_DIR=$4
-GPU=${5:-0}
-PORT=${6:-8000}
+POLICY_CONFIG=$2
+POLICY_DIR=$3
+GPU=${4:-0}
+PORT=${5:-8000}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="$ROOT/.venv/bin/python"
@@ -89,7 +88,6 @@ for seed in "${SEEDS[@]}"; do
     --args.host 127.0.0.1 \
     --args.port "$PORT" \
     --args.task-suite-name libero_object \
-    --args.object-condition "$OBJECT_CONDITION" \
     --args.task-ids "${TASK_IDS[@]}" \
     --args.max-tasks "${#TASK_IDS[@]}" \
     --args.num-trials-per-task 1 \

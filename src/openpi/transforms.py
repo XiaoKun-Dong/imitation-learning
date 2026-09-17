@@ -187,45 +187,8 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        source_hw = next(iter(data["image"].values())).shape[:2]
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
-        if "target_mask" in data:
-            # Keep target mask in the same padded image frame as the RGB inputs.
-            target_mask = data["target_mask"]
-            if target_mask.ndim == 2:
-                target_mask = np.repeat(target_mask[..., None], 3, axis=-1)
-            data["target_mask"] = image_tools.resize_with_pad(
-                target_mask.astype(np.uint8) * 255,
-                self.height,
-                self.width,
-            )[..., 0] > 127
-        if "target_crop" in data:
-            data["target_crop"] = image_tools.resize_with_pad(data["target_crop"], self.height, self.width)
-        if "target_bbox" in data:
-            data["target_bbox"] = _resize_bbox_with_pad(data["target_bbox"], source_hw, (self.height, self.width))
         return data
-
-
-def _resize_bbox_with_pad(
-    bbox: np.ndarray,
-    source_hw: tuple[int, int],
-    target_hw: tuple[int, int],
-) -> np.ndarray:
-    """Map absolute pixel bbox [x1, y1, x2, y2) through resize-with-pad.
-
-    The bbox convention is fixed as pixel coordinates in the current image frame,
-    with x2/y2 exclusive. It is not a normalized [0, 1] box.
-    """
-    source_height, source_width = source_hw
-    target_height, target_width = target_hw
-    ratio = max(source_width / target_width, source_height / target_height)
-    resized_height = int(source_height / ratio)
-    resized_width = int(source_width / ratio)
-    pad_h0 = (target_height - resized_height) // 2
-    pad_w0 = (target_width - resized_width) // 2
-    scale = np.asarray([resized_width / source_width, resized_height / source_height] * 2, dtype=np.float32)
-    offset = np.asarray([pad_w0, pad_h0, pad_w0, pad_h0], dtype=np.float32)
-    return bbox.astype(np.float32) * scale + offset
 
 
 @dataclasses.dataclass(frozen=True)

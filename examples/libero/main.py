@@ -5,24 +5,19 @@ import logging
 import math
 import pathlib
 import random
-from typing import Literal
 
 import imageio
 import numpy as np
-import object_condition as _object_condition
 from openpi_client import base_policy as _base_policy
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
-from PIL import Image
-from PIL import ImageDraw
-from robosuite.utils import camera_utils
 import tqdm
 import tyro
 
 from openpi.models import demovla_visualization
 from openpi.shared import libero_runtime as _libero_runtime
 
-benchmark, get_libero_path, OffScreenRenderEnv, SegmentationRenderEnv = _libero_runtime.import_modules(
+benchmark, get_libero_path, OffScreenRenderEnv = _libero_runtime.import_modules(
     pathlib.Path(__file__).resolve().parents[2]
 )
 
@@ -46,7 +41,6 @@ class Args:
     task_suite_name: str = (
         "libero_object"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
-    object_condition: Literal["none", "2d", "2d_empty", "2d_wrong", "3d"] = "none"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
     task_category: str | None = None  # LIBERO-plus perturbation category, e.g. "Objects Layout".
@@ -55,12 +49,12 @@ class Args:
     shuffle_tasks: bool = False
     max_tasks: int | None = None
     task_ids: tuple[int, ...] = ()  # Optional 1-based benchmark task IDs.
+    episode_ids: tuple[int, ...] = ()  # Optional zero-based initial-state/episode IDs; overrides num_trials_per_task.
 
     #################################################################################################################
     # Utils
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
-    debug_object_overlay: bool = False  # Overlay the live target mask and bbox on rollout videos.
     # Optional failure taxonomy. Disabled for official-compatible evaluation so
     # the normal rollout path only performs the operations in upstream OpenPI.
     track_grasp_diagnostics: bool = False
@@ -124,20 +118,21 @@ def eval_libero(args: Args) -> None:
 
         # Get default LIBERO initial states
         initial_states = task_suite.get_task_init_states(task_id)
+        episode_indices = args.episode_ids or tuple(range(args.num_trials_per_task))
+        invalid_episode_ids = [episode_id for episode_id in episode_indices if not 0 <= episode_id < len(initial_states)]
+        if invalid_episode_ids:
+            raise ValueError(
+                f"episode_ids must be in [0, {len(initial_states) - 1}] for task {task_id + 1}; "
+                f"got {invalid_episode_ids}"
+            )
 
         # Initialize LIBERO environment and task description
-        needs_segmentation = args.object_condition != "none" or args.debug_object_overlay
-        env, task_description = _get_libero_env(
-            task,
-            LIBERO_ENV_RESOLUTION,
-            args.seed,
-            needs_segmentation=needs_segmentation,
-        )
+        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
         # Start episodes
         task_episodes, task_successes = 0, 0
         task_target_grasps, task_wrong_object_grasps = 0, 0
-        for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+        for episode_idx in tqdm.tqdm(episode_indices):
             logging.info(f"\nTask: {task_description}")
 
             # Reset environment
@@ -154,9 +149,6 @@ def eval_libero(args: Args) -> None:
             wrong_object_grasped = False
             interaction_visualizations_saved = 0
             replan_index = 0
-            condition_object_name = None
-            if args.object_condition == "2d_wrong":
-                condition_object_name = _object_condition.select_wrong_object(env)
             done = False
 
             logging.info(f"Starting episode {task_episodes + 1}...")
@@ -179,25 +171,7 @@ def eval_libero(args: Args) -> None:
                     wrist_img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
-                    target_condition = None
-                    needs_policy_condition = args.object_condition != "none" and not action_plan
-                    if args.debug_object_overlay or needs_policy_condition:
-                        if args.object_condition == "2d_empty" and needs_policy_condition:
-                            target_condition = _object_condition.empty_condition(img)
-                        else:
-                            target_condition = _get_target_object_condition(
-                                env,
-                                obs,
-                                img,
-                                args.resize_size,
-                                include_point=args.object_condition == "3d" and needs_policy_condition,
-                                object_name=condition_object_name,
-                            )
-
-                    replay_image = img
-                    if args.debug_object_overlay and target_condition is not None:
-                        replay_image = _draw_object_overlay(img, target_condition[0], target_condition[1])
-                    replay_images.append(replay_image)
+                    replay_images.append(img)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -224,19 +198,6 @@ def eval_libero(args: Args) -> None:
                                 ],
                                 dtype=np.uint32,
                             )
-                        if args.object_condition != "none":
-                            assert target_condition is not None
-                            target_mask, target_bbox, target_crop, target_point = target_condition
-                            element.update(
-                                {
-                                    "target_mask": target_mask,
-                                    "target_bbox": target_bbox,
-                                    "target_crop": target_crop,
-                                }
-                            )
-                            if args.object_condition == "3d":
-                                element["target_point"] = target_point
-
                         # Query model to get action
                         policy_result = client.infer(element)
                         action_chunk = policy_result["actions"]
@@ -278,7 +239,49 @@ def eval_libero(args: Args) -> None:
                                 stem="interaction",
                                 replan_index=replan_index,
                                 env_step=t - args.num_steps_wait,
+                                prompt=str(task_description),
+                                save_raw=True,
+                                action_to_memory_attention=policy_result.get(
+                                    "interaction_action_to_memory_attention"
+                                ),
+                                action_to_memory_head_attention=policy_result.get(
+                                    "interaction_action_to_memory_head_attention"
+                                ),
+                                interaction_memory=policy_result.get("interaction_memory"),
+                                effective_visual_attention=policy_result.get(
+                                    "interaction_effective_visual_attention"
+                                ),
+                                adapter_gate=policy_result.get("interaction_adapter_gate"),
+                                adapter_injection_ratio=policy_result.get(
+                                    "interaction_adapter_injection_ratio"
+                                ),
+                                flow_times=policy_result.get("interaction_flow_times"),
+                                injection_layers=policy_result.get("interaction_injection_layers"),
                             )
+                            effective_diagnostics = {
+                                "interaction_action_to_memory_attention",
+                                "interaction_effective_visual_attention",
+                                "interaction_injection_layers",
+                            }
+                            if effective_diagnostics <= policy_result.keys():
+                                demovla_visualization.save_effective_interaction_attention_replan(
+                                    images=debug_images,
+                                    camera_names=policy_result["interaction_camera_names"],
+                                    effective_visual_attention=policy_result[
+                                        "interaction_effective_visual_attention"
+                                    ],
+                                    action_to_memory_attention=policy_result[
+                                        "interaction_action_to_memory_attention"
+                                    ],
+                                    camera_mask=policy_result["interaction_camera_mask"],
+                                    patch_grid_shape=policy_result["interaction_patch_grid_shape"],
+                                    injection_layers=policy_result["interaction_injection_layers"],
+                                    output_dir=episode_interaction_dir,
+                                    stem="effective",
+                                    replan_index=replan_index,
+                                    env_step=t - args.num_steps_wait,
+                                    prompt=str(task_description),
+                                )
                             interaction_visualizations_saved += 1
                         replan_index += 1
                         assert len(action_chunk) >= args.replan_steps, (
@@ -335,8 +338,6 @@ def eval_libero(args: Args) -> None:
                 "success": bool(done),
                 "target_grasped": target_grasped if args.track_grasp_diagnostics else None,
                 "wrong_object_grasped": wrong_object_grasped if args.track_grasp_diagnostics else None,
-                "object_condition": args.object_condition,
-                "condition_object_name": condition_object_name,
                 "policy_noise_seed": args.policy_noise_seed,
                 "steps": t,
             }
@@ -437,148 +438,17 @@ def _select_tasks(args: Args, task_suite) -> list[tuple[int, dict]]:
     return selected
 
 
-def _get_libero_env(task, resolution, seed, *, needs_segmentation: bool = False):
+def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {
-        "bddl_file_name": str(task_bddl_file),
-        "camera_heights": resolution,
-        "camera_widths": resolution,
-    }
-    if needs_segmentation:
-        env = SegmentationRenderEnv(
-            **env_args,
-            camera_segmentations="instance",
-            camera_depths=True,
-        )
-    else:
-        # Match the official OpenPI LIBERO evaluator exactly for normal rollouts.
-        env = OffScreenRenderEnv(**env_args)
+    env = OffScreenRenderEnv(
+        bddl_file_name=str(task_bddl_file),
+        camera_heights=resolution,
+        camera_widths=resolution,
+    )
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
-
-
-def _get_target_object_condition(
-    env,
-    obs,
-    image: np.ndarray,
-    resize_size: int,
-    *,
-    include_point: bool = True,
-    object_name: str | None = None,
-):
-    """Build target object mask/bbox/crop in the same frame as observation/image.
-
-    LIBERO's BDDL obj_of_interest may include destination objects. For LIBERO Object,
-    the first object is the manipulated target, which is the signal we want here.
-    """
-    seg = _get_agentview_segmentation(obs)
-    seg = np.ascontiguousarray(seg[::-1, ::-1])
-    raw_target_mask = _object_condition.mask_from_segmentation(env, seg, object_name)
-    raw_target_bbox = _bbox_from_mask(raw_target_mask)
-    target_point = None
-    if include_point:
-        depth = np.ascontiguousarray(_get_agentview_depth(obs)[::-1, ::-1])
-        target_point = _target_point_from_depth(env, raw_target_mask, raw_target_bbox, depth)
-
-    mask_rgb = np.repeat(raw_target_mask[..., None], 3, axis=-1).astype(np.uint8) * 255
-    target_mask = image_tools.resize_with_pad(mask_rgb, resize_size, resize_size, method=Image.Resampling.NEAREST)
-    target_mask = target_mask[..., 0] > 127
-    target_bbox = _bbox_from_mask(target_mask)
-    target_crop = _crop_from_bbox(image, target_bbox)
-    return target_mask, target_bbox, target_crop, target_point
-
-
-def _get_agentview_segmentation(obs):
-    for key in ("agentview_segmentation_instance", "agentview_instance_segmentation", "agentview_segmentation"):
-        if key in obs:
-            segmentation = np.asarray(obs[key])
-            if segmentation.ndim == 3:
-                # LIBERO / robosuite may render instance ids as HxWx1 or in the first
-                # channel of a multi-channel segmentation image.
-                segmentation = segmentation[..., 0]
-            return segmentation
-    seg_keys = [key for key in obs if "agentview" in key and "seg" in key]
-    raise KeyError(f"Could not find agentview segmentation in obs. Available segmentation-like keys: {seg_keys}")
-
-
-def _get_agentview_depth(obs):
-    for key in ("agentview_depth", "agentview_depth_image", "agentview_image_depth"):
-        if key in obs:
-            depth = np.asarray(obs[key])
-            return depth[..., 0] if depth.ndim == 3 else depth
-    depth_keys = [key for key in obs if "agentview" in key and "depth" in key]
-    raise KeyError(f"Could not find agentview depth in obs. Available depth-like keys: {depth_keys}")
-
-
-def _target_mask_from_segmentation(env, segmentation_image):
-    return _object_condition.mask_from_segmentation(env, segmentation_image, None)
-
-
-def _bbox_from_mask(mask):
-    """Return absolute pixel bbox [x1, y1, x2, y2) with x2/y2 exclusive."""
-    ys, xs = np.where(mask)
-    if xs.size == 0:
-        return np.zeros((4,), dtype=np.float32)
-    return np.asarray([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float32)
-
-
-def _crop_from_bbox(image, bbox):
-    x1, y1, x2, y2 = bbox.astype(np.int32)
-    padded = np.zeros_like(image)
-    if x2 <= x1 or y2 <= y1:
-        return padded
-    padded[y1:y2, x1:x2] = image[y1:y2, x1:x2]
-    return padded
-
-
-def _draw_object_overlay(image: np.ndarray, mask: np.ndarray, bbox: np.ndarray) -> np.ndarray:
-    """Overlay a translucent target mask and its bbox without modifying the policy input image."""
-    overlay = np.asarray(image).copy()
-    mask = np.asarray(mask, dtype=bool)
-    if mask.shape != overlay.shape[:2]:
-        raise ValueError(f"Mask shape {mask.shape} does not match image shape {overlay.shape[:2]}")
-
-    if np.any(mask):
-        color = np.asarray([255, 64, 64], dtype=np.float32)
-        overlay[mask] = np.rint(overlay[mask].astype(np.float32) * 0.55 + color * 0.45).astype(np.uint8)
-
-    x1, y1, x2, y2 = np.asarray(bbox).astype(np.int32)
-    if x2 > x1 and y2 > y1:
-        height, width = overlay.shape[:2]
-        x1, y1 = np.clip([x1, y1], [0, 0], [width - 1, height - 1])
-        x2, y2 = np.clip([x2 - 1, y2 - 1], [0, 0], [width - 1, height - 1])
-        output = Image.fromarray(overlay)
-        ImageDraw.Draw(output).rectangle((int(x1), int(y1), int(x2), int(y2)), outline=(64, 255, 128), width=2)
-        overlay = np.asarray(output)
-    return overlay
-
-
-def _target_point_from_depth(env, mask, bbox, depth):
-    """Return agentview-camera-frame target center [x, y, z] in meters."""
-    if not np.any(mask):
-        return np.zeros((3,), dtype=np.float32)
-
-    metric_depth = camera_utils.get_real_depth_map(env.sim, depth)
-    valid_depth = metric_depth[mask]
-    valid_depth = valid_depth[np.isfinite(valid_depth) & (valid_depth > 0)]
-    if valid_depth.size == 0:
-        return np.zeros((3,), dtype=np.float32)
-
-    z = np.median(valid_depth).astype(np.float32)
-    x1, y1, x2, y2 = bbox.astype(np.float32)
-    u = (x1 + x2 - 1.0) * 0.5
-    v = (y1 + y2 - 1.0) * 0.5
-    height, width = depth.shape[:2]
-    fovy = float(env.sim.model.cam_fovy[env.sim.model.camera_name2id("agentview")])
-    fy = 0.5 * height / np.tan(np.deg2rad(fovy) * 0.5)
-    fx = fy
-    cx = (width - 1.0) * 0.5
-    cy = (height - 1.0) * 0.5
-    x = (u - cx) / fx * z
-    y = (v - cy) / fy * z
-    return np.asarray([x, y, z], dtype=np.float32)
 
 
 def _get_grasp_state(env):

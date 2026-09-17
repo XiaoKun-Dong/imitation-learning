@@ -1,6 +1,8 @@
 import dataclasses
 import enum
+import hashlib
 import logging
+import pathlib
 import socket
 from typing import Literal
 
@@ -9,6 +11,7 @@ import tyro
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
+from openpi.shared import normalize as _normalize
 from openpi.training import config as _config
 
 
@@ -55,11 +58,17 @@ class Args:
     # This increases inference work and websocket payload size.
     interaction_diagnostics: bool = False
 
-    # Parameter-free DemoVLA inference ablation. ``layer_mean`` replaces the
-    # learned dynamic gate with one fixed probability per injection layer;
+    # Parameter-free DemoVLA inference ablation. Explicit layer-mean gates can
+    # be composed with memory interventions (for example zero memory at 0.03).
     # ``off`` bypasses interaction-memory injection entirely.
-    interaction_ablation: Literal["normal", "layer_mean", "off"] = "normal"
+    interaction_ablation: Literal["normal", "layer_mean", "off", "zero_memory", "batch_shuffle"] = "normal"
     interaction_layer_mean_gates: tuple[float, float, float] | None = None
+
+    # Optional explicit normalization-statistics directory. This is intended
+    # for controlled evaluation matrices in which checkpoint weights and
+    # normalization statistics are varied independently. The directory must
+    # contain ``norm_stats.json``; checkpoint assets remain untouched.
+    norm_stats_dir: str | None = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -106,6 +115,13 @@ def create_default_policy(
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     sample_kwargs = {"interaction_diagnostics": args.interaction_diagnostics}
+    norm_stats = None
+    if args.norm_stats_dir is not None:
+        norm_stats_dir = pathlib.Path(args.norm_stats_dir).resolve()
+        norm_stats_path = norm_stats_dir / "norm_stats.json"
+        norm_stats = _normalize.load(norm_stats_dir)
+        digest = hashlib.sha256(norm_stats_path.read_bytes()).hexdigest()
+        logging.info("Using explicit norm stats: path=%s sha256=%s", norm_stats_path, digest)
     if args.interaction_ablation != "normal" or args.interaction_layer_mean_gates is not None:
         sample_kwargs.update(
             {
@@ -120,8 +136,11 @@ def create_policy(args: Args) -> _policy.Policy:
                 args.policy.dir,
                 default_prompt=args.default_prompt,
                 sample_kwargs=sample_kwargs,
+                norm_stats=norm_stats,
             )
         case Default():
+            if norm_stats is not None:
+                raise ValueError("explicit norm stats require policy:checkpoint")
             if args.interaction_ablation != "normal" or args.interaction_layer_mean_gates is not None:
                 raise ValueError("interaction ablations require policy:checkpoint with a DemoVLA config")
             return create_default_policy(

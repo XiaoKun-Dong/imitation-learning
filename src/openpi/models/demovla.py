@@ -86,6 +86,9 @@ def _apply_sparse_deep_adapter(
     injection_layers,
     layer_index,
     hidden_groups,
+    readout_mode="standard",
+    temperature_min=0.5,
+    temperature_max=2.0,
 ):
     """Pure JAX action-token hook compatible with Flax's scanned blocks."""
     action_hidden = hidden_groups[1]
@@ -93,8 +96,13 @@ def _apply_sparse_deep_adapter(
         return hidden_groups
 
     def inject(hidden):
+        matches = layer_index == injection_layers
+        gate_index = jnp.argmax(matches)
+        query_hidden = hidden
+        if readout_mode == "recovery":
+            query_hidden = query_hidden + params["readout_layer_embeddings"][gate_index][None, None, :]
         query = _linear(
-            _layer_norm(hidden, params["norm_scale"], params["norm_bias"]),
+            _layer_norm(query_hidden, params["norm_scale"], params["norm_bias"]),
             params["query_kernel"],
             params["query_bias"],
         )
@@ -104,14 +112,24 @@ def _apply_sparse_deep_adapter(
         query_heads = einops.rearrange(query, "b q (h d) -> b h q d", h=num_heads)
         key_heads = einops.rearrange(key, "b k (h d) -> b h k d", h=num_heads)
         value_heads = einops.rearrange(value, "b k (h d) -> b h k d", h=num_heads)
+        if readout_mode == "recovery":
+            query_heads = query_heads * jax.lax.rsqrt(
+                jnp.mean(jnp.square(query_heads.astype(jnp.float32)), axis=-1, keepdims=True) + 1.0e-6
+            ).astype(query_heads.dtype)
+            key_heads = key_heads * jax.lax.rsqrt(
+                jnp.mean(jnp.square(key_heads.astype(jnp.float32)), axis=-1, keepdims=True) + 1.0e-6
+            ).astype(key_heads.dtype)
         logits = jnp.einsum("bhqd,bhkd->bhqk", query_heads, key_heads) * (head_dim**-0.5)
+        if readout_mode == "recovery":
+            temperature = temperature_min + (temperature_max - temperature_min) * jax.nn.sigmoid(
+                params["readout_temperature_logits"][gate_index]
+            )
+            logits = logits * temperature.astype(logits.dtype)
         weights = jax.nn.softmax(logits, axis=-1)
         delta = jnp.einsum("bhqk,bhkd->bhqd", weights, value_heads)
         delta = einops.rearrange(delta, "b h q d -> b q (h d)")
         delta = _linear(delta, params["output_kernel"], params["output_bias"])
 
-        matches = layer_index == injection_layers
-        gate_index = jnp.argmax(matches)
         if gate_mode == "dynamic":
             if hidden.shape[-2] != params["slot_embeddings"].shape[0]:
                 raise ValueError(
@@ -157,9 +175,14 @@ def _apply_sparse_deep_adapter(
         # scanned/conditional layer adapter even though the diagnostic has no
         # loss weight. Stop gradients before computing every diagnostic.
         diagnostic_gated_delta = jax.lax.stop_gradient(gated_delta.astype(jnp.float32))
+        diagnostic_delta = jax.lax.stop_gradient(delta.astype(jnp.float32))
         diagnostic_hidden = jax.lax.stop_gradient(hidden.astype(jnp.float32))
         diagnostic_weights = jax.lax.stop_gradient(weights.astype(jnp.float32))
         injection_ratio = jnp.linalg.norm(diagnostic_gated_delta, axis=-1) / jnp.maximum(
+            jnp.linalg.norm(diagnostic_hidden, axis=-1),
+            1.0e-6,
+        )
+        ungated_delta_ratio = jnp.linalg.norm(diagnostic_delta, axis=-1) / jnp.maximum(
             jnp.linalg.norm(diagnostic_hidden, axis=-1),
             1.0e-6,
         )
@@ -171,7 +194,10 @@ def _apply_sparse_deep_adapter(
             "attention_entropy": attention_entropy,
             "gate": jax.lax.stop_gradient(gate.astype(jnp.float32)),
             "injection_ratio": injection_ratio,
+            "head_slot_attention": diagnostic_weights,
             "raw_gate": jax.lax.stop_gradient(raw_gate.astype(jnp.float32)),
+            "slot_attention": jnp.mean(diagnostic_weights, axis=1),
+            "ungated_delta_ratio": ungated_delta_ratio,
         }
         return (hidden + gated_delta).astype(hidden.dtype), aux
 
@@ -180,7 +206,16 @@ def _apply_sparse_deep_adapter(
         "attention_entropy": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
         "gate": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
         "injection_ratio": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
+        "head_slot_attention": jnp.zeros(
+            (action_hidden.shape[0], num_heads, action_hidden.shape[1], interaction_memory.shape[-2]),
+            dtype=jnp.float32,
+        ),
         "raw_gate": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
+        "slot_attention": jnp.zeros(
+            (*action_hidden.shape[:2], interaction_memory.shape[-2]),
+            dtype=jnp.float32,
+        ),
+        "ungated_delta_ratio": jnp.zeros(action_hidden.shape[:2], dtype=jnp.float32),
     }
     action_hidden, aux = jax.lax.cond(
         jnp.any(matches),
@@ -215,6 +250,14 @@ class DemoVLAConfig(pi0_config.Pi0Config):
     interaction_attention_diversity_margin: float = 0.5
     interaction_memory_diversity_weight: float = 0.0
     interaction_memory_diversity_margin: float = 0.5
+    interaction_output_init_std: float = 0.0
+    interaction_readout_mode: Literal["standard", "recovery"] = "standard"
+    interaction_readout_temperature_min: float = 0.5
+    interaction_readout_temperature_max: float = 2.0
+    interaction_readout_temperature_init: float = 1.0
+    interaction_memory_ranking_weight: float = 0.0
+    interaction_memory_ranking_margin: float = 2.0e-5
+    interaction_memory_ranking_mode: Literal["batch_shuffle", "prompt_hard_negative"] = "batch_shuffle"
 
     def __post_init__(self):
         super().__post_init__()
@@ -244,6 +287,24 @@ class DemoVLAConfig(pi0_config.Pi0Config):
             raise ValueError("interaction_attention_diversity_weight must be non-negative")
         if self.interaction_memory_diversity_weight < 0.0:
             raise ValueError("interaction_memory_diversity_weight must be non-negative")
+        if self.interaction_output_init_std < 0.0:
+            raise ValueError("interaction_output_init_std must be non-negative")
+        if self.interaction_readout_mode not in ("standard", "recovery"):
+            raise ValueError(f"unsupported interaction_readout_mode: {self.interaction_readout_mode}")
+        if not 0.0 < self.interaction_readout_temperature_min < self.interaction_readout_temperature_max:
+            raise ValueError("readout temperature bounds must satisfy 0 < min < max")
+        if not (
+            self.interaction_readout_temperature_min
+            < self.interaction_readout_temperature_init
+            < self.interaction_readout_temperature_max
+        ):
+            raise ValueError("readout temperature init must lie strictly inside its bounds")
+        if self.interaction_memory_ranking_weight < 0.0:
+            raise ValueError("interaction_memory_ranking_weight must be non-negative")
+        if self.interaction_memory_ranking_margin < 0.0:
+            raise ValueError("interaction_memory_ranking_margin must be non-negative")
+        if self.interaction_memory_ranking_mode not in ("batch_shuffle", "prompt_hard_negative"):
+            raise ValueError(f"unsupported interaction_memory_ranking_mode: {self.interaction_memory_ranking_mode}")
         if not -1.0 <= self.interaction_attention_diversity_margin <= 1.0:
             raise ValueError("interaction_attention_diversity_margin must be in [-1, 1]")
         if not -1.0 <= self.interaction_memory_diversity_margin <= 1.0:
@@ -268,20 +329,6 @@ class DemoVLAConfig(pi0_config.Pi0Config):
     def create(self, rng: at.KeyArrayLike) -> DemoVLA:
         return DemoVLA(self, rngs=nnx.Rngs(rng))
 
-    @override
-    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        observation, actions = super().inputs_spec(batch_size=batch_size)
-        # DemoVLA deliberately has no externally supplied object condition.
-        with at.disable_typechecking():
-            observation = observation.replace(
-                target_mask=None,
-                target_bbox=None,
-                target_crop=None,
-                target_point=None,
-            )
-        return observation, actions
-
-
 class DemoVLA(pi0.Pi0):
     """Pi0.5 with a self-grounded sparse interaction-memory adapter."""
 
@@ -303,6 +350,12 @@ class DemoVLA(pi0.Pi0):
         self.interaction_attention_diversity_margin = config.interaction_attention_diversity_margin
         self.interaction_memory_diversity_weight = config.interaction_memory_diversity_weight
         self.interaction_memory_diversity_margin = config.interaction_memory_diversity_margin
+        self.interaction_readout_mode = config.interaction_readout_mode
+        self.interaction_readout_temperature_min = config.interaction_readout_temperature_min
+        self.interaction_readout_temperature_max = config.interaction_readout_temperature_max
+        self.interaction_memory_ranking_weight = config.interaction_memory_ranking_weight
+        self.interaction_memory_ranking_margin = config.interaction_memory_ranking_margin
+        self.interaction_memory_ranking_mode = config.interaction_memory_ranking_mode
 
         vlm_width = _gemma.get_config(config.paligemma_variant).width
         action_width = _gemma.get_config(config.action_expert_variant).width
@@ -353,6 +406,28 @@ class DemoVLA(pi0.Pi0):
             bias_init=nnx.initializers.zeros,
             rngs=rngs,
         )
+        if config.interaction_readout_mode == "recovery":
+            self.demovla_readout_layer_embeddings = nnx.Param(
+                jnp.zeros((len(config.interaction_injection_layers), action_width), dtype=jnp.float32)
+            )
+            initial_fraction = (
+                (config.interaction_readout_temperature_init - config.interaction_readout_temperature_min)
+                / (config.interaction_readout_temperature_max - config.interaction_readout_temperature_min)
+            )
+            initial_logit = jnp.log(initial_fraction) - jnp.log1p(-initial_fraction)
+            self.demovla_readout_temperature_logits = nnx.Param(
+                jnp.full((len(config.interaction_injection_layers),), initial_logit, dtype=jnp.float32)
+            )
+        if config.interaction_output_init_std > 0.0:
+            output_key = rngs.params()
+            self.demovla_action_output_proj.kernel.value = (
+                jax.random.normal(
+                    output_key,
+                    self.demovla_action_output_proj.kernel.value.shape,
+                    dtype=jnp.float32,
+                )
+                * config.interaction_output_init_std
+            )
         if config.interaction_gate_mode == "dynamic":
             gate_embedding_dim = config.interaction_dynamic_gate_embedding_dim
             slot_key = rngs.params()
@@ -612,27 +687,99 @@ class DemoVLA(pi0.Pi0):
 
     def configure_interaction_inference_ablation(
         self,
-        mode: Literal["normal", "layer_mean", "off"],
+        mode: Literal["normal", "layer_mean", "off", "zero_memory", "batch_shuffle"],
         layer_mean_gates: tuple[float, ...] = (),
     ) -> None:
-        """Configure a parameter-free inference ablation before JIT compilation."""
-        if mode not in ("normal", "layer_mean", "off"):
+        """Configure parameter-free memory and gate interventions before JIT compilation.
+
+        An explicit ``layer_mean_gates`` tuple may be composed with a memory
+        intervention such as ``zero_memory``. This keeps the gate probabilities
+        identical between correct- and ablated-memory policies.
+        """
+        if mode not in ("normal", "layer_mean", "off", "zero_memory", "batch_shuffle"):
             raise ValueError(f"unsupported interaction inference ablation: {mode}")
-        if mode == "layer_mean":
-            if self.interaction_gate_mode != "dynamic" or self.interaction_injection_mode != "sparse_deep":
-                raise ValueError("layer_mean ablation requires a sparse-deep dynamic-gate model")
+        if mode == "layer_mean" and not layer_mean_gates:
+            raise ValueError("layer_mean ablation requires fixed gate probabilities")
+        if layer_mean_gates:
+            if mode == "off":
+                raise ValueError("fixed gate probabilities cannot be combined with the off ablation")
+            if self.interaction_injection_mode != "sparse_deep":
+                raise ValueError("fixed gate probabilities require a sparse-deep model")
             if len(layer_mean_gates) != len(self.interaction_injection_layers):
                 raise ValueError(
-                    "layer_mean ablation requires one gate probability per injection layer: "
+                    "fixed gate override requires one gate probability per injection layer: "
                     f"expected {len(self.interaction_injection_layers)}, got {len(layer_mean_gates)}"
                 )
-            if any(not 0.0 < gate < 1.0 for gate in layer_mean_gates):
-                raise ValueError("layer mean gate probabilities must be strictly between 0 and 1")
-        elif layer_mean_gates:
-            raise ValueError("layer_mean_gates can only be provided for the layer_mean ablation")
+            if any(not 0.0 <= gate < 1.0 for gate in layer_mean_gates):
+                raise ValueError("fixed gate probabilities must be in [0, 1)")
 
         self.interaction_inference_ablation = mode
         self.interaction_inference_layer_mean_gates = tuple(float(gate) for gate in layer_mean_gates)
+
+    def _apply_interaction_memory_ablation(
+        self,
+        interaction_memory: at.Float[at.Array, "b interaction_s action_d"],
+    ) -> at.Float[at.Array, "b interaction_s action_d"]:
+        """Apply a memory-only intervention without changing the VLM prefix.
+
+        ``batch_shuffle`` uses a deterministic half-batch cyclic shift. This is
+        a derangement for even evaluation batches and avoids consuming another
+        RNG stream, so correct and shuffled losses retain identical flow noise.
+        It is intentionally rejected for online batch-1 rollout, where a batch
+        shuffle would otherwise be the identity intervention.
+        """
+        if self.interaction_inference_ablation == "zero_memory":
+            return jnp.zeros_like(interaction_memory)
+        if self.interaction_inference_ablation == "batch_shuffle":
+            batch_size = interaction_memory.shape[0]
+            if batch_size < 2:
+                raise ValueError("batch_shuffle memory ablation requires batch size >= 2")
+            return jnp.roll(interaction_memory, shift=max(1, batch_size // 2), axis=0)
+        return interaction_memory
+
+    def _make_prompt_hard_negative(
+        self,
+        observation: _model.Observation,
+    ) -> tuple[_model.Observation, at.Float[at.Array, " b"]]:
+        """Replace only the prompt with the closest different prompt in the batch.
+
+        Similarity is positional token overlap over valid prompt positions. Exact
+        duplicates are excluded, so repeated examples from the same LIBERO task
+        cannot become false negatives. Images, state, and image augmentation stay
+        bit-identical to the correct observation.
+        """
+        tokens = observation.tokenized_prompt
+        masks = observation.tokenized_prompt_mask
+        if tokens is None or masks is None:
+            raise ValueError("prompt hard-negative ranking requires tokenized prompts")
+        if tokens.ndim != 2 or tokens.shape[0] < 2:
+            raise ValueError("prompt hard-negative ranking requires a batch size of at least two")
+
+        token_equal = tokens[:, None, :] == tokens[None, :, :]
+        mask_equal = masks[:, None, :] == masks[None, :, :]
+        same_prompt = jnp.all(token_equal & mask_equal, axis=-1)
+        jointly_valid = masks[:, None, :] & masks[None, :, :]
+        overlap = jnp.sum(token_equal & jointly_valid, axis=-1).astype(jnp.float32)
+        union_length = jnp.sum(masks[:, None, :] | masks[None, :, :], axis=-1).astype(jnp.float32)
+        similarity = overlap / jnp.maximum(union_length, 1.0)
+        similarity = jnp.where(same_prompt, -jnp.inf, similarity)
+        negative_indices = jnp.argmax(similarity, axis=-1)
+        has_negative = jnp.any(~same_prompt, axis=-1)
+        fallback_indices = (jnp.arange(tokens.shape[0]) + 1) % tokens.shape[0]
+        negative_indices = jnp.where(has_negative, negative_indices, fallback_indices)
+        selected_similarity = jnp.take_along_axis(
+            similarity,
+            negative_indices[:, None],
+            axis=1,
+        )[:, 0]
+        selected_similarity = jnp.where(has_negative, selected_similarity, 0.0)
+        return (
+            observation.replace(
+                tokenized_prompt=tokens[negative_indices],
+                tokenized_prompt_mask=masks[negative_indices],
+            ),
+            selected_similarity,
+        )
 
     def _make_sparse_deep_adapter(
         self,
@@ -652,10 +799,21 @@ class DemoVLA(pi0.Pi0):
             "output_kernel": self.demovla_action_output_proj.kernel.value,
             "output_bias": self.demovla_action_output_proj.bias.value,
         }
+        if self.interaction_readout_mode == "recovery":
+            params.update(
+                {
+                    "readout_layer_embeddings": self.demovla_readout_layer_embeddings.value,
+                    "readout_temperature_logits": self.demovla_readout_temperature_logits.value,
+                }
+            )
         adapter_gate_mode = self.interaction_gate_mode
-        if self.interaction_inference_ablation == "layer_mean":
+        if self.interaction_inference_layer_mean_gates:
             gate_probabilities = jnp.asarray(self.interaction_inference_layer_mean_gates, dtype=jnp.float32)
-            params["gates"] = jnp.log(gate_probabilities) - jnp.log1p(-gate_probabilities)
+            params["gates"] = jnp.where(
+                gate_probabilities == 0.0,
+                -jnp.inf,
+                jnp.log(gate_probabilities) - jnp.log1p(-gate_probabilities),
+            )
             adapter_gate_mode = "scalar"
         elif self.interaction_gate_mode == "dynamic":
             params.update(
@@ -677,6 +835,9 @@ class DemoVLA(pi0.Pi0):
                 _apply_sparse_deep_adapter,
                 self.interaction_num_heads,
                 adapter_gate_mode,
+                readout_mode=self.interaction_readout_mode,
+                temperature_min=self.interaction_readout_temperature_min,
+                temperature_max=self.interaction_readout_temperature_max,
             ),
             params,
             interaction_memory,
@@ -799,6 +960,7 @@ class DemoVLA(pi0.Pi0):
         interaction_memory, visual_attention = self._extract_interaction_memory_and_attention(
             observation, prefix_hidden
         )
+        interaction_memory = self._apply_interaction_memory_ablation(interaction_memory)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
             observation, x_t, time, interaction_memory
         )
@@ -811,10 +973,54 @@ class DemoVLA(pi0.Pi0):
             prefix_mask,
             kv_cache,
             interaction_memory,
-            return_adapter_aux=self.interaction_gate_mode == "dynamic",
+            return_adapter_aux=(
+                self.interaction_injection_mode == "sparse_deep"
+                and self.interaction_inference_ablation != "off"
+            ),
         )
         velocity = self.action_out_proj(suffix_out[:, -self.action_horizon :])
         flow_loss = jnp.mean(jnp.square(velocity - u_t), axis=-1)
+
+        ranking_regularization = jnp.asarray(0.0, dtype=jnp.float32)
+        shuffled_flow_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        counterfactual_flow_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        prompt_negative_similarity = jnp.asarray(0.0, dtype=jnp.float32)
+        ranking_active_rate = jnp.asarray(0.0, dtype=jnp.float32)
+        if self.interaction_memory_ranking_weight > 0.0:
+            if self.interaction_memory_ranking_mode == "batch_shuffle":
+                counterfactual_memory = jnp.roll(interaction_memory, shift=1, axis=0)
+            else:
+                negative_observation, negative_similarity = self._make_prompt_hard_negative(observation)
+                _, _, _, negative_prefix_hidden = self._encode_prefix(negative_observation)
+                counterfactual_memory, _ = self._extract_interaction_memory_and_attention(
+                    negative_observation,
+                    negative_prefix_hidden,
+                )
+                counterfactual_memory = self._apply_interaction_memory_ablation(counterfactual_memory)
+                prompt_negative_similarity = jnp.mean(negative_similarity)
+            counterfactual_suffix_out, _ = self._forward_action_expert(
+                suffix_tokens,
+                suffix_mask,
+                suffix_ar_mask,
+                adarms_cond,
+                prefix_length,
+                prefix_mask,
+                kv_cache,
+                counterfactual_memory,
+                return_adapter_aux=False,
+            )
+            counterfactual_velocity = self.action_out_proj(
+                counterfactual_suffix_out[:, -self.action_horizon :]
+            )
+            counterfactual_flow = jnp.mean(jnp.square(counterfactual_velocity - u_t), axis=-1)
+            counterfactual_flow_loss = jnp.mean(counterfactual_flow)
+            if self.interaction_memory_ranking_mode == "batch_shuffle":
+                shuffled_flow_loss = counterfactual_flow_loss
+            ranking_hinge = jax.nn.relu(
+                self.interaction_memory_ranking_margin + flow_loss - counterfactual_flow
+            )
+            ranking_active_rate = jnp.mean(ranking_hinge > 0.0)
+            ranking_regularization = self.interaction_memory_ranking_weight * jnp.mean(ranking_hinge)
 
         attention_diversity_loss, attention_pair_cosine_mean, attention_pair_cosine_max = _pairwise_diversity_loss(
             visual_attention,
@@ -828,7 +1034,8 @@ class DemoVLA(pi0.Pi0):
             self.interaction_attention_diversity_weight * attention_diversity_loss
             + self.interaction_memory_diversity_weight * memory_diversity_loss
         )
-        total_loss = flow_loss + diversity_regularization.astype(flow_loss.dtype)
+        auxiliary_regularization = diversity_regularization + ranking_regularization
+        total_loss = flow_loss + auxiliary_regularization.astype(flow_loss.dtype)
         metrics = {
             "demovla_flow_loss": jnp.mean(flow_loss),
             "demovla_attention_diversity_loss": attention_diversity_loss,
@@ -838,6 +1045,12 @@ class DemoVLA(pi0.Pi0):
             "demovla_memory_pair_cosine_mean": memory_pair_cosine_mean,
             "demovla_memory_pair_cosine_max": memory_pair_cosine_max,
             "demovla_diversity_regularization": diversity_regularization,
+            "demovla_memory_ranking_regularization": ranking_regularization,
+            "demovla_shuffled_memory_flow_loss": shuffled_flow_loss,
+            "demovla_counterfactual_memory_flow_loss": counterfactual_flow_loss,
+            "demovla_prompt_negative_similarity": prompt_negative_similarity,
+            "demovla_memory_ranking_active_rate": ranking_active_rate,
+            "demovla_auxiliary_regularization": auxiliary_regularization,
         }
         if adapter_aux is not None:
             injection_layer_indices = jnp.asarray(self.interaction_injection_layers, dtype=jnp.int32)
@@ -849,17 +1062,29 @@ class DemoVLA(pi0.Pi0):
                     "demovla_dynamic_gate_std": jnp.std(gates),
                     "demovla_dynamic_gate_raw_mean": jnp.mean(dynamic_aux["raw_gate"]),
                     "demovla_dynamic_injection_ratio_mean": jnp.mean(dynamic_aux["injection_ratio"]),
+                    "demovla_dynamic_ungated_delta_ratio_mean": jnp.mean(dynamic_aux["ungated_delta_ratio"]),
                     "demovla_dynamic_attention_entropy_mean": jnp.mean(dynamic_aux["attention_entropy"]),
                     "demovla_dynamic_flow_time_mean": jnp.mean(time),
+                    "demovla_adapter_gate_mean": jnp.mean(gates),
+                    "demovla_adapter_injection_ratio_mean": jnp.mean(dynamic_aux["injection_ratio"]),
+                    "demovla_adapter_ungated_delta_ratio_mean": jnp.mean(dynamic_aux["ungated_delta_ratio"]),
                 }
             )
             for layer_offset, layer in enumerate(self.interaction_injection_layers):
                 layer_gates = gates[layer_offset]
                 layer_injection_ratio = dynamic_aux["injection_ratio"][layer_offset]
+                layer_ungated_delta_ratio = dynamic_aux["ungated_delta_ratio"][layer_offset]
                 layer_attention_entropy = dynamic_aux["attention_entropy"][layer_offset]
                 metrics[f"demovla_dynamic_gate_layer_{layer}_mean"] = jnp.mean(layer_gates)
                 metrics[f"demovla_dynamic_gate_layer_{layer}_std"] = jnp.std(layer_gates)
                 metrics[f"demovla_dynamic_injection_ratio_layer_{layer}_mean"] = jnp.mean(layer_injection_ratio)
+                metrics[f"demovla_dynamic_ungated_delta_ratio_layer_{layer}_mean"] = jnp.mean(
+                    layer_ungated_delta_ratio
+                )
+                metrics[f"demovla_adapter_injection_ratio_layer_{layer}_mean"] = jnp.mean(layer_injection_ratio)
+                metrics[f"demovla_adapter_ungated_delta_ratio_layer_{layer}_mean"] = jnp.mean(
+                    layer_ungated_delta_ratio
+                )
                 metrics[f"demovla_dynamic_attention_entropy_layer_{layer}_mean"] = jnp.mean(layer_attention_entropy)
                 for slot in range(self.action_horizon):
                     metrics[f"demovla_dynamic_gate_layer_{layer}_slot_{slot}_mean"] = jnp.mean(layer_gates[:, slot])
@@ -884,12 +1109,79 @@ class DemoVLA(pi0.Pi0):
                     metrics[f"{metric_prefix}_injection_ratio_mean"] = jnp.sum(
                         layer_injection_ratio * flow_mask_float[:, None]
                     ) / (safe_count * self.action_horizon)
+                    metrics[f"{metric_prefix}_ungated_delta_ratio_mean"] = jnp.sum(
+                        layer_ungated_delta_ratio * flow_mask_float[:, None]
+                    ) / (safe_count * self.action_horizon)
                     metrics[f"{metric_prefix}_attention_entropy_mean"] = jnp.sum(
                         layer_attention_entropy * flow_mask_float[:, None]
                     ) / (safe_count * self.action_horizon)
                     for slot in range(self.action_horizon):
                         metrics[f"{metric_prefix}_slot_{slot}_gate_mean"] = slot_gate_mean[slot]
         return total_loss, metrics
+
+    def compute_flow_loss_with_memory_source(
+        self,
+        rng: at.KeyArrayLike,
+        action_observation: _model.Observation,
+        memory_observation: _model.Observation,
+        actions: _model.Actions,
+    ) -> tuple[
+        at.Float[at.Array, "*b ah"],
+        at.Float[at.Array, "*b interaction_s action_d"],
+        at.Float[at.Array, "*b interaction_s views patches"],
+    ]:
+        """Compute flow loss while sourcing memory from a counterfactual prompt.
+
+        The action prefix/KV cache always comes from ``action_observation``.
+        Only the interaction-memory extractor sees ``memory_observation``, which
+        isolates task-conditioned memory from the base VLM prompt pathway.
+        """
+        if not self.use_interaction_memory:
+            raise ValueError("memory-source diagnostics require use_interaction_memory=True")
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        action_observation = _model.preprocess_observation(
+            preprocess_rng,
+            action_observation,
+            train=False,
+        )
+        memory_observation = _model.preprocess_observation(
+            preprocess_rng,
+            memory_observation,
+            train=False,
+        )
+        batch_shape = actions.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        prefix_length, prefix_mask, kv_cache, _ = self._encode_prefix(action_observation)
+        _, _, _, memory_prefix_hidden = self._encode_prefix(memory_observation)
+        interaction_memory, visual_attention = self._extract_interaction_memory_and_attention(
+            memory_observation,
+            memory_prefix_hidden,
+        )
+        interaction_memory = self._apply_interaction_memory_ablation(interaction_memory)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            action_observation,
+            x_t,
+            time,
+            interaction_memory,
+        )
+        suffix_out, _ = self._forward_action_expert(
+            suffix_tokens,
+            suffix_mask,
+            suffix_ar_mask,
+            adarms_cond,
+            prefix_length,
+            prefix_mask,
+            kv_cache,
+            interaction_memory,
+        )
+        velocity = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        flow_loss = jnp.mean(jnp.square(velocity - u_t), axis=-1)
+        return flow_loss, interaction_memory, visual_attention
 
     @override
     def sample_actions(
@@ -911,12 +1203,87 @@ class DemoVLA(pi0.Pi0):
 
         prefix_length, prefix_mask, kv_cache, prefix_hidden = self._encode_prefix(observation)
         interaction_memory = self.extract_interaction_memory(observation, prefix_hidden)
+        interaction_memory = self._apply_interaction_memory_ablation(interaction_memory)
 
         def step(carry):
             x_t, time = carry
             batch_time = jnp.broadcast_to(time, batch_size)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation,
+                x_t,
+                batch_time,
+                interaction_memory,
+            )
+            suffix_out, _ = self._forward_action_expert(
+                suffix_tokens,
+                suffix_mask,
+                suffix_ar_mask,
+                adarms_cond,
+                prefix_length,
+                prefix_mask,
+                kv_cache,
+                interaction_memory,
+            )
+            velocity = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return x_t + dt * velocity, time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        actions, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return actions
+
+    def sample_actions_with_memory_source(
+        self,
+        rng: at.KeyArrayLike,
+        action_observation: _model.Observation,
+        memory_observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        interaction_memory_override: at.Float[at.Array, "b interaction_s action_d"] | None = None,
+    ) -> _model.Actions:
+        """Sample actions while changing only the interaction-memory source.
+
+        ``action_observation`` always supplies the action VLM prefix, suffix,
+        state, and KV cache. ``memory_observation`` is encoded independently and
+        is visible only to the DemoVLA memory extractor. Supplying
+        ``interaction_memory_override`` bypasses that extraction entirely. This
+        interface supports prompt-only counterfactuals and memory transplant
+        experiments without changing the base policy prompt pathway.
+        """
+        if not self.use_interaction_memory:
+            raise ValueError("memory-source sampling requires use_interaction_memory=True")
+
+        action_observation = _model.preprocess_observation(None, action_observation, train=False)
+        memory_observation = _model.preprocess_observation(None, memory_observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = action_observation.state.shape[0]
+        if memory_observation.state.shape[0] != batch_size:
+            raise ValueError("action and memory observations must have matching batch sizes")
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        prefix_length, prefix_mask, kv_cache, _ = self._encode_prefix(action_observation)
+        if interaction_memory_override is None:
+            _, _, _, memory_prefix_hidden = self._encode_prefix(memory_observation)
+            interaction_memory = self.extract_interaction_memory(memory_observation, memory_prefix_hidden)
+        else:
+            interaction_memory = interaction_memory_override
+            expected_prefix = (batch_size, self.num_interaction_tokens)
+            if interaction_memory.ndim != 3 or interaction_memory.shape[:2] != expected_prefix:
+                raise ValueError(
+                    "interaction memory override must have shape "
+                    f"[batch, {self.num_interaction_tokens}, width], got {interaction_memory.shape}"
+                )
+        interaction_memory = self._apply_interaction_memory_ablation(interaction_memory)
+
+        def step(carry):
+            x_t, time = carry
+            batch_time = jnp.broadcast_to(time, batch_size)
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                action_observation,
                 x_t,
                 batch_time,
                 interaction_memory,
@@ -950,15 +1317,131 @@ class DemoVLA(pi0.Pi0):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         top_k: int = 4,
     ) -> tuple[_model.Actions, dict[str, at.Array]]:
-        """Sample actions and return the interaction patches for this replan."""
+        """Sample actions and return extractor plus action-read diagnostics."""
         actions = self.sample_actions(
             rng,
             observation,
             num_steps=num_steps,
             noise=noise,
         )
-        diagnostics = self.interaction_diagnostics(observation, top_k=top_k)
+        diagnostics = self.interaction_action_diagnostics(
+            rng,
+            observation,
+            num_steps=num_steps,
+            noise=noise,
+            top_k=top_k,
+        )
         return actions, diagnostics
+
+    def interaction_action_diagnostics(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        top_k: int = 4,
+    ) -> dict[str, at.Array]:
+        """Replay denoising and expose how each injection layer reads visual memory.
+
+        This diagnostic runs separately from the standard action sampler. Given
+        the same RNG/noise, it follows the same denoising trajectory while
+        collecting adapter auxiliaries; returned policy actions still come from
+        the unmodified standard sampling graph.
+        """
+        if not self.use_interaction_memory:
+            raise ValueError("interaction diagnostics require use_interaction_memory=True")
+        if self.interaction_injection_mode != "sparse_deep":
+            raise ValueError("action-to-memory diagnostics require sparse_deep injection")
+        if self.interaction_inference_ablation == "off":
+            raise ValueError("action-to-memory diagnostics are unavailable when injection is off")
+
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        prefix_length, prefix_mask, kv_cache, prefix_hidden = self._encode_prefix(observation)
+        interaction_memory, patch_diagnostics = self.interaction_patch_diagnostics(
+            observation,
+            prefix_hidden,
+            top_k=top_k,
+        )
+        patch_diagnostics["interaction_memory"] = interaction_memory
+        interaction_memory = self._apply_interaction_memory_ablation(interaction_memory)
+        injection_layer_indices = jnp.asarray(self.interaction_injection_layers, dtype=jnp.int32)
+
+        def step(carry, _):
+            x_t, time = carry
+            batch_time = jnp.broadcast_to(time, batch_size)
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation,
+                x_t,
+                batch_time,
+                interaction_memory,
+            )
+            suffix_out, adapter_aux = self._forward_action_expert(
+                suffix_tokens,
+                suffix_mask,
+                suffix_ar_mask,
+                adarms_cond,
+                prefix_length,
+                prefix_mask,
+                kv_cache,
+                interaction_memory,
+                return_adapter_aux=True,
+            )
+            assert adapter_aux is not None
+            adapter_aux = jax.tree.map(lambda value: value[injection_layer_indices], adapter_aux)
+            velocity = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            next_carry = (x_t + dt * velocity, time + dt)
+            step_aux = {
+                "gate": adapter_aux["gate"],
+                "head_slot_attention": adapter_aux["head_slot_attention"],
+                "injection_ratio": adapter_aux["injection_ratio"],
+                "slot_attention": adapter_aux["slot_attention"],
+            }
+            return next_carry, step_aux
+
+        (_, _), denoising_aux = jax.lax.scan(
+            step,
+            (noise, jnp.asarray(1.0, dtype=jnp.float32)),
+            xs=None,
+            length=num_steps,
+        )
+        # scan: [flow, layer, batch, action, ...] -> [batch, flow, layer, action, ...]
+        slot_attention = jnp.transpose(denoising_aux["slot_attention"], (2, 0, 1, 3, 4))
+        head_slot_attention = jnp.transpose(denoising_aux["head_slot_attention"], (2, 0, 1, 3, 4, 5))
+        gates = jnp.transpose(denoising_aux["gate"], (2, 0, 1, 3))
+        injection_ratio = jnp.transpose(denoising_aux["injection_ratio"], (2, 0, 1, 3))
+        visual_attention = patch_diagnostics["interaction_visual_attention"]
+        effective_visual_attention = jnp.einsum(
+            "btlaq,bqvp->btlavp",
+            slot_attention,
+            visual_attention,
+        )
+        flow_times = 1.0 + dt * jnp.arange(num_steps, dtype=jnp.float32)
+        patch_diagnostics.update(
+            {
+                "interaction_action_to_memory_attention": slot_attention,
+                "interaction_action_to_memory_head_attention": head_slot_attention,
+                "interaction_effective_visual_attention": effective_visual_attention,
+                "interaction_adapter_gate": gates,
+                "interaction_adapter_injection_ratio": injection_ratio,
+                "interaction_flow_times": jnp.broadcast_to(flow_times, (batch_size, num_steps)),
+                "interaction_injection_layers": jnp.broadcast_to(
+                    injection_layer_indices,
+                    (batch_size, len(self.interaction_injection_layers)),
+                ),
+            }
+        )
+        grid_height, grid_width = self._patch_grid_shape()
+        patch_diagnostics["interaction_patch_grid_shape"] = jnp.broadcast_to(
+            jnp.asarray([grid_height, grid_width], dtype=jnp.int32),
+            (batch_size, 2),
+        )
+        return patch_diagnostics
 
     def interaction_diagnostics(
         self,
@@ -973,11 +1456,12 @@ class DemoVLA(pi0.Pi0):
         observation = _model.preprocess_observation(None, observation, train=False)
         batch_size = observation.state.shape[0]
         _, _, _, prefix_hidden = self._encode_prefix(observation)
-        _, diagnostics = self.interaction_patch_diagnostics(
+        memory, diagnostics = self.interaction_patch_diagnostics(
             observation,
             prefix_hidden,
             top_k=top_k,
         )
+        diagnostics["interaction_memory"] = memory
         grid_height, grid_width = self._patch_grid_shape()
         diagnostics["interaction_patch_grid_shape"] = jnp.broadcast_to(
             jnp.asarray([grid_height, grid_width], dtype=jnp.int32),

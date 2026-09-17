@@ -11,6 +11,11 @@ from openpi.training import config as _config
 from . import train
 
 
+def test_format_console_metric_handles_numeric_and_text_values():
+    assert train._format_console_metric("loss", 0.125) == "loss=0.1250"  # noqa: SLF001
+    assert train._format_console_metric("state", "frozen") == "state=frozen"  # noqa: SLF001
+
+
 @pytest.mark.parametrize("config_name", ["debug"])
 def test_train(tmp_path: pathlib.Path, config_name: str):
     config = dataclasses.replace(

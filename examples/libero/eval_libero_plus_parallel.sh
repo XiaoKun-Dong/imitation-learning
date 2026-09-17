@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
+if [[ $# -ne 3 ]]; then
   cat >&2 <<'EOF'
 Usage:
-  eval_libero_plus_parallel.sh LABEL OBJECT_CONDITION POLICY_CONFIG POLICY_DIR
+  eval_libero_plus_parallel.sh LABEL POLICY_CONFIG POLICY_DIR
 
 Example:
-  eval_libero_plus_parallel.sh object_2d 2d \
-    pi05_libero_object_2d_cross_attention \
-    checkpoints/pi05_libero_object_2d_cross_attention/2d_syncaug_bs8_5k/4999
+  eval_libero_plus_parallel.sh demovla_eval \
+    demovla_libero_sparse_deep_dynamic_gate \
+    checkpoints/demovla_libero_sparse_deep_dynamic_gate/dynamic_gate_v1/29999
 EOF
   exit 2
 fi
 
 LABEL=$1
-OBJECT_CONDITION=$2
-POLICY_CONFIG=$3
-POLICY_DIR=$4
+POLICY_CONFIG=$2
+POLICY_DIR=$3
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="$ROOT/.venv/bin/python"
@@ -119,7 +118,6 @@ for index in "${!GPUS[@]}"; do
     --args.host 127.0.0.1 \
     --args.port "$port" \
     --args.task-suite-name libero_object \
-    --args.object-condition "$OBJECT_CONDITION" \
     --args.task-ids "${TASK_IDS[@]}" \
     --args.max-tasks 50 \
     --args.num-trials-per-task 1 \

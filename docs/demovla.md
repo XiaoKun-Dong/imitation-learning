@@ -4,8 +4,12 @@
 
 - 工作名称：DemoVLA
 - 基础模型：OpenPI `pi0.5`
-- 当前阶段：Dynamic gate 30k 已完成训练、配对消融和 LIBERO Object 500-episode 正式评估；开始迁移至 Kuavo 真机数据
-- 最新结果：[DemoVLA Sparse-Deep Diversity 10k 训练与评估报告](demovla_sparse_deep_diversity_10k.md)
+- 当前阶段：LIBERO 仿真因果定位；Stage A fixed-0.03 已完成全套件配对评测，正在验证关键 replan 的内容特异作用
+- 仿真结果总览：[DemoVLA 仿真实验结果总览与证据审计](demovla_simulation_results_status_20260831_zh.md)
+- 阶段 A/B1/S1：[固定门控预热、readout 与语义排序实验](demovla_stage_a_causal_evaluation_zh.md)
+- 局部行为因果：[关键 Replan 因果定位](demovla_key_replan_causal_progress_zh.md)
+- 最新因果测评：[DemoVLA × Norm Stats 严格因果测评报告](demovla_norm_stats_causal_evaluation_20260824.md)
+- Diversity 结果：[DemoVLA Sparse-Deep Diversity 10k 训练与评估报告](demovla_sparse_deep_diversity_10k.md)
 - 无 diversity 基线：[DemoVLA Sparse-Deep 30k 训练报告](demovla_sparse_deep_training_report.md)
 - 核心约束：
   - 不引入 SAM、DINO、GroundingDINO 等额外视觉模型。
@@ -24,6 +28,11 @@
 - Policy server、websocket diagnostics、LIBERO rollout、视频和 episode metrics 链路。
 - Dynamic gate 已训练到 29999 step，并通过固定 flow noise 的逐 episode 配对消融。
 - Dynamic gate 在官方口径 LIBERO Object 评估中取得 495/500，成功率 99.0%。
+- Stage A `4999` 在 fixed gate `0.03` 下取得 395/400；相对 injection off 为
+  `+2.25pp`、McNemar `p=0.02246`，相对 matched zero-memory 为 `+1.00pp`、
+  `p=0.2891`，因此后者尚未建立总体行为显著性。
+- 关键 replan 已得到一个严格共享前缀的局部内容因果样本；跨 episode/跨 server
+  稳健复现仍未完成。
 - `demovla_libero_sparse_deep_diverse` adapter-only 训练到 10k。
 - 10-task、每任务 1 次、seed 7 的 `libero_object` pilot：9/10 成功，0 次目标
   抓取失败，0 次错物抓取，1 次 post-grasp failure。
@@ -51,7 +60,6 @@ rotate agentview and wrist images by 180 degrees
 wait steps = 10
 replan steps = 5
 trials per task = 50
-object condition = none
 interaction diagnostics = off
 flow noise = stateful policy RNG
 ```
@@ -93,10 +101,13 @@ injection_off 13/30  43.33%
 pi05_official 29/30  96.67%
 ```
 
-`injection_off` 相对官方参考的配对差异显著，McNemar `p=0.000145`。该结果
-说明当前 checkpoint 已依赖 interaction injection；同时，关闭注入后仍使用
-该 checkpoint 的本地 LIBERO Object norm stats，不能将其低成功率解释为官方 pi0.5
-backbone 本身退化。
+`injection_off` 相对官方参考的配对差异显著，McNemar `p=0.000145`。后续
+[DemoVLA × Norm Stats 严格因果测评](demovla_norm_stats_causal_evaluation_20260824.md)
+确认该对照同时受到 local norm stats 影响：100-episode 固定-noise 矩阵中，
+`off + official stats` 为 `99/100`，`off + local stats` 为 `42/100`，
+`dynamic + official stats` 为 `19/100`，`dynamic + local stats` 为 `100/100`。
+因此原结果证明的是 dynamic injection 对当前 local-stats checkpoint 的必要性和补偿
+作用，不能单独解释为 interaction 架构相对正确配置的官方 pi0.5 backbone 的纯增益。
 
 此前 gate 机制消融的 10-episode pilot 为：
 
@@ -113,6 +124,8 @@ static_deep   0/10
 
 ### 1.3 尚未完成
 
+- 在第二个独立 episode 或独立 server 轨迹上复现 integrated-auto 的局部内容翻转。
+- 将 B1、S1 和 lockstep 原始输出从评测节点恢复到可审计归档。
 - 将 diverse 10k 扩展至每任务 10 次，缩小置信区间。
 - 若保留 3k checkpoint，则完成 3k/10k 对比；同时补齐 single-shot、vanilla
   和 parameter-matched baseline 的相同 initial states 对比。
@@ -775,7 +788,6 @@ MUJOCO_EGL_DEVICE_ID=0 \
 CUDA_VISIBLE_DEVICES=0 \
 uv run python examples/libero/main.py \
   --args.task-suite-name libero_object \
-  --args.object-condition none \
   --args.num-trials-per-task 1 \
   --args.seed 7 \
   --args.policy-noise-seed 0 \

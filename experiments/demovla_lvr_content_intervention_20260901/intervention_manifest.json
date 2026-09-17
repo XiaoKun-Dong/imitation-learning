@@ -1,0 +1,147 @@
+{
+  "protocol_id": "demovla_lvr_content_pilot_v1",
+  "status": "frozen_before_rollout",
+  "frozen_at": "2026-09-01T18:15:43+08:00",
+  "scope": "LIBERO simulation only; excludes the earlier 2026-09-01 identical-object experiment",
+  "research_question": "Does the identity/content of one interaction-memory pulse change closed-loop behavior from an exactly shared correct-memory prefix?",
+  "execution_host": {
+    "hostname": "ubuntu-R5350",
+    "address": "192.168.20.68",
+    "gpus": "8 x NVIDIA GeForce RTX 4090, 49140 MiB each",
+    "repository_root": "/home/dongxiaokun/imitation-learning/openpi",
+    "git_commit": "71f761b77d835cce6dc945c730161ff7fd56799b",
+    "worktree_clean": false,
+    "note": "The evaluation worktree contains prior research changes; critical executable files are frozen by SHA256 below."
+  },
+  "checkpoint": {
+    "policy_config": "demovla_libero_full_stage_a_fixed_gate",
+    "path": "checkpoints/demovla_libero_full_stage_a_fixed_gate/stage_a_fixed005_seed42_v2/4999",
+    "recursive_file_manifest_sha256": "7230638d10d25d75724963399ef019f38db0c20c88a0c5c72b47412211d160dd",
+    "hash_recipe": "find CHECKPOINT -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum",
+    "checkpoint_metadata_sha256": "31256321f29bbfdaebfd710f6230fc796e07e7a94636957b60c0bac584b9dd15",
+    "params_metadata_sha256": "242369af72657166a6e36f7eaad6f7d8cae995d9bbc80d86082dfee8171905e7"
+  },
+  "normalization": {
+    "type": "official pi0.5 LIBERO stats",
+    "path": "assets/libero_full_matched/physical-intelligence/libero/norm_stats.json",
+    "sha256": "44af18e5ac3a8cb142670a3d21d59d55174c844cc8ac920e67d6ff667ec9174e"
+  },
+  "critical_code_sha256": {
+    "src/openpi/models/demovla.py": "47f9fabc0ec042fce7779f06e4da336ae4ab823d93bda26de2a81fd60ccdc427",
+    "src/openpi/policies/policy.py": "3094dbf30d51bbf691a6d9378c672b18e58ff43ec8ce329a5a5eb572b0eff77e",
+    "scripts/serve_policy.py": "7d0345e6048af06b07f9d4a4952d4026979919764e770f8863eca9c0e6edf1f4",
+    "packages/openpi-client/src/openpi_client/base_policy.py": "0756f02ee5f157bf59822dc54d4305c4f1833aae092f5a390a70aeec6619a4e3",
+    "examples/libero/main.py": "b9286390d2ef42d74f34c03c978385d46e925d44a57b23928bd308e081ff2860",
+    "examples/libero/run_demovla_content_lockstep.py": "0e59e4441341f67a38970c5dfba04d4f23b3bd6e36cdebee9cdbfc6d37f7f0df",
+    "examples/libero/eval_demovla_content_lockstep_4gpu.sh": "013bc69b60e75c049ba3e7a07f68ad05125c39ff3be3b9b8ed12a6d8936f51c2"
+  },
+  "shared_protocol": {
+    "task_suite": "libero_10",
+    "environment_seed": 7,
+    "flow_noise_seed": 0,
+    "flow_noise_key": "[seed, task_id, episode_id, replan_index]",
+    "normalization": "official",
+    "fixed_gates": [0.03, 0.03, 0.03],
+    "replan_steps": 5,
+    "wait_steps": 10,
+    "max_environment_steps": 520,
+    "prefix_condition": "correct",
+    "post_branch_condition": "correct",
+    "intervention_duration_replans": 1,
+    "condition_order": [
+      "correct",
+      "shuffled",
+      "zero",
+      "injection_off",
+      "wrong_prompt"
+    ],
+    "wrong_prompt_definition": "Highest token-Jaccard prompt among other tasks in the same suite; only the memory extractor receives it, while the action prefix remains correct.",
+    "shuffled_definition": "A frozen current_memory tensor from a different pre-registered sample; tensor shape and model normalization match the target condition."
+  },
+  "sampling": {
+    "seed": 20260901,
+    "method": "Deterministic stratified random sample selected before any new rollout outcome was observed.",
+    "candidate_universe": "LIBERO-10 task_id 1..10, episode_id 0..9; early replan 12..24, middle 36..52, late 64..80.",
+    "exclusions": [
+      "Previously intensively analyzed task 9 episodes 3, 6, and 8 are not target points.",
+      "The earlier identical-object stress test is outside this protocol."
+    ]
+  },
+  "pilot_points": [
+    {
+      "point_id": "p01",
+      "task_id": 8,
+      "episode_id": 9,
+      "branch_replan": 18,
+      "phase_bin": "early:12-24",
+      "shuffled_memory_file": "outputs/demovla_key_replan/stagea4999_libero10_task9_ep3_v1/correct/replans/replan_046_step_0230.npz",
+      "shuffled_memory_sha256": "c4b126a76c307e5586a5a358ce97eb7f7b1f166bd815c4379b570c883565110f",
+      "shuffled_memory_shape": [4, 1024]
+    },
+    {
+      "point_id": "p02",
+      "task_id": 1,
+      "episode_id": 5,
+      "branch_replan": 46,
+      "phase_bin": "middle:36-52",
+      "shuffled_memory_file": "outputs/demovla_key_replan/stagea4999_libero10_task9_ep3_v1/correct/replans/replan_072_step_0360.npz",
+      "shuffled_memory_sha256": "1545603b70c4f7b1160d23f17ba3ac5359054af8e126584eb6ec9122538cbc3f",
+      "shuffled_memory_shape": [4, 1024]
+    },
+    {
+      "point_id": "p03",
+      "task_id": 5,
+      "episode_id": 2,
+      "branch_replan": 72,
+      "phase_bin": "late:64-80",
+      "shuffled_memory_file": "outputs/demovla_key_replan/stagea4999_libero10_task9_ep3_v1/correct/replans/replan_013_step_0065.npz",
+      "shuffled_memory_sha256": "288c27ac5d9a28e0a70e4adfbaabb75c2229404a8e9c27189b9379e5b3c4646b",
+      "shuffled_memory_shape": [4, 1024]
+    },
+    {
+      "point_id": "p04",
+      "task_id": 3,
+      "episode_id": 6,
+      "branch_replan": 13,
+      "phase_bin": "early:12-24",
+      "shuffled_memory_file": "outputs/demovla_key_replan/stagea4999_libero10_task9_ep3_v1/correct/replans/replan_018_step_0090.npz",
+      "shuffled_memory_sha256": "b0951a9b3969350f20941c814ddb94f2e897cbd68bc5b245ec8899229ff33086",
+      "shuffled_memory_shape": [4, 1024]
+    }
+  ],
+  "endpoints": {
+    "primary_closed_loop": "Paired task success: correct vs shuffled.",
+    "secondary_closed_loop": [
+      "correct vs zero",
+      "correct vs injection_off"
+    ],
+    "diagnostic_closed_loop": "correct vs wrong_prompt",
+    "local_action": "L2 over the five executed branch actions, split into translation, rotation, and gripper components.",
+    "audit": [
+      "initialization_max_abs_diff == 0",
+      "prefix_max_abs_diff == 0",
+      "branch_image_equal == true",
+      "branch_state_equal == true"
+    ]
+  },
+  "outcome_rules": {
+    "success": "LIBERO environment reports task completion before the fixed step limit.",
+    "timeout": "Counted as failure, not excluded.",
+    "task_completes_before_branch": "Retained and marked intervention_not_reached; not replaced based on outcome.",
+    "prefix_or_branch_audit_failure": "Retained as protocol-invalid with the exact failure; rerun is allowed only with identical settings after an infrastructure/code fix.",
+    "server_or_encoding_failure": "Retained as infrastructure failure; rerun the same point without substituting another sample.",
+    "reporting": "All four registered points and every condition are reported, including concordant outcomes and negative examples."
+  },
+  "pilot_decision_gate": {
+    "purpose": "Validate lockstep correctness and logging, not estimate a publishable effect.",
+    "pass": "At least 3 of 4 points reach the branch, satisfy all four audit checks, and produce complete summaries, trajectories, and videos for every condition.",
+    "fail": "Do not expand; repair only the protocol/infrastructure issue and rerun the same registered points.",
+    "expansion": "If the pilot passes, freeze a new independent 20-50 point target list without using pilot intervention outcomes for selection."
+  },
+  "statistical_plan_after_expansion": {
+    "unit": "independent pre-registered branch point",
+    "primary": "correct vs shuffled discordant counts, paired success-rate difference, exact McNemar test, and 95% confidence interval",
+    "secondary": "The same outputs for correct vs zero and correct vs injection_off",
+    "small_n_rule": "The four-point pilot is reported descriptively and is never used for a headline significance claim."
+  }
+}

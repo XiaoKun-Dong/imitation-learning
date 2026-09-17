@@ -139,7 +139,6 @@ run_one() {
     --args.host 127.0.0.1 \
     --args.port "$PORT" \
     --args.task-suite-name libero_object \
-    --args.object-condition none \
     --args.resize-size 224 \
     --args.replan-steps 5 \
     --args.num-steps-wait 10 \

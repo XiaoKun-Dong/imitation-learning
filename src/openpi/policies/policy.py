@@ -92,12 +92,22 @@ class Policy(BasePolicy):
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            self._sample_actions_with_memory_source = None
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            memory_source_sampler = getattr(model, "sample_actions_with_memory_source", None)
+            self._sample_actions_with_memory_source = (
+                nnx_utils.module_jit(memory_source_sampler) if memory_source_sampler is not None else None
+            )
             self._interaction_diagnostics_fn = None
+            self._interaction_diagnostics_uses_sampling_context = False
             if self._interaction_diagnostics:
-                debug_method = getattr(model, "interaction_diagnostics", None)
+                debug_method = getattr(model, "interaction_action_diagnostics", None)
+                if debug_method is not None:
+                    self._interaction_diagnostics_uses_sampling_context = True
+                else:
+                    debug_method = getattr(model, "interaction_diagnostics", None)
                 if debug_method is None:
                     raise ValueError("interaction_diagnostics requires a model with interaction diagnostic support")
                 self._interaction_diagnostics_fn = nnx_utils.module_jit(debug_method)
@@ -108,22 +118,54 @@ class Policy(BasePolicy):
         rng_or_device: at.KeyArrayLike | str,
         observation: _model.Observation,
         sample_kwargs: dict[str, Any],
+        *,
+        memory_observation: _model.Observation | None = None,
+        interaction_memory_override: at.Array | None = None,
     ) -> tuple[Any, dict[str, Any] | None]:
         """Use one action sampler regardless of whether diagnostics are enabled."""
+        if memory_observation is not None or interaction_memory_override is not None:
+            if self._sample_actions_with_memory_source is None:
+                raise ValueError("memory-source interventions require a JAX DemoVLA model")
+            actions = self._sample_actions_with_memory_source(
+                rng_or_device,
+                observation,
+                memory_observation if memory_observation is not None else observation,
+                interaction_memory_override=interaction_memory_override,
+                **sample_kwargs,
+            )
+            # Existing action-read diagnostics assume one shared observation.
+            # Returning no diagnostics here avoids silently labeling action-prefix
+            # diagnostics as if they came from the counterfactual memory source.
+            return actions, None
+
         actions = self._sample_actions(rng_or_device, observation, **sample_kwargs)
         diagnostics = None
         if self._interaction_diagnostics:
             assert self._interaction_diagnostics_fn is not None
-            diagnostics = self._interaction_diagnostics_fn(observation)
+            if getattr(self, "_interaction_diagnostics_uses_sampling_context", False):
+                diagnostics = self._interaction_diagnostics_fn(
+                    rng_or_device,
+                    observation,
+                    **sample_kwargs,
+                )
+            else:
+                diagnostics = self._interaction_diagnostics_fn(observation)
         return actions, diagnostics
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Remove protocol-only inputs before observation transforms see them.
         flow_noise_seed = obs.get(_base_policy.FLOW_NOISE_SEED_KEY)
-        inputs = {key: value for key, value in obs.items() if key != _base_policy.FLOW_NOISE_SEED_KEY}
+        memory_prompt = obs.get(_base_policy.INTERACTION_MEMORY_PROMPT_KEY)
+        interaction_memory_override = obs.get(_base_policy.INTERACTION_MEMORY_OVERRIDE_KEY)
+        protocol_keys = {
+            _base_policy.FLOW_NOISE_SEED_KEY,
+            _base_policy.INTERACTION_MEMORY_PROMPT_KEY,
+            _base_policy.INTERACTION_MEMORY_OVERRIDE_KEY,
+        }
+        raw_inputs = {key: value for key, value in obs.items() if key not in protocol_keys}
         # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, inputs)
+        raw_inputs = jax.tree.map(lambda x: x, raw_inputs)
         if flow_noise_seed is not None:
             if noise is not None:
                 raise ValueError("provide either explicit noise or a flow noise seed, not both")
@@ -132,12 +174,23 @@ class Policy(BasePolicy):
                 (self._model.action_horizon, self._model.action_dim),
             )
 
-        inputs = self._input_transform(inputs)
+        inputs = self._input_transform(raw_inputs)
+        memory_inputs = None
+        if memory_prompt is not None:
+            if not isinstance(memory_prompt, str):
+                raise ValueError("interaction memory prompt override must be a string")
+            memory_raw_inputs = dict(raw_inputs)
+            memory_raw_inputs["prompt"] = memory_prompt
+            memory_inputs = self._input_transform(memory_raw_inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+            if memory_inputs is not None:
+                memory_inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], memory_inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
+            if memory_inputs is not None or interaction_memory_override is not None:
+                raise ValueError("memory-source interventions are only supported by JAX DemoVLA models")
             # Convert inputs to PyTorch tensors and move to correct device
             import torch
 
@@ -159,6 +212,12 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+        memory_observation = _model.Observation.from_dict(memory_inputs) if memory_inputs is not None else None
+        memory_override_array = None
+        if interaction_memory_override is not None:
+            memory_override_array = jnp.asarray(interaction_memory_override)
+            if memory_override_array.ndim == 2:
+                memory_override_array = memory_override_array[None, ...]
         start_time = time.monotonic()
         # Diagnostics must not select a different action-sampling graph. Always
         # generate actions through the standard sampler, then compute diagnostics
@@ -167,6 +226,8 @@ class Policy(BasePolicy):
             sample_rng_or_pytorch_device,
             observation,
             sample_kwargs,
+            memory_observation=memory_observation,
+            interaction_memory_override=memory_override_array,
         )
         outputs = {
             "state": inputs["state"],
